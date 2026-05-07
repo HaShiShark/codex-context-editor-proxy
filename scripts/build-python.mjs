@@ -42,6 +42,30 @@ function removeWorkspacePath(target) {
   rmSync(resolvedTarget, { recursive: true, force: true });
 }
 
+function pyInstallerArgs(name, scriptPath, workPath) {
+  const args = [
+    '-m',
+    'PyInstaller',
+    '--noconfirm',
+    '--clean',
+    '--distpath',
+    pythonDist,
+    '--workpath',
+    workPath,
+    '--specpath',
+    workPath,
+    '--name',
+    name,
+  ];
+
+  if (!isWindows) {
+    args.push('--onefile');
+  }
+
+  args.push(scriptPath);
+  return args;
+}
+
 if (!existsSync(venvPython)) {
   run(systemPython, ['-m', 'venv', buildVenv]);
 }
@@ -53,34 +77,5 @@ removeWorkspacePath(pythonDist);
 removeWorkspacePath(webWork);
 removeWorkspacePath(proxyWork);
 
-run(venvPython, [
-  '-m',
-  'PyInstaller',
-  '--noconfirm',
-  '--clean',
-  '--distpath',
-  pythonDist,
-  '--workpath',
-  webWork,
-  '--specpath',
-  webWork,
-  '--name',
-  'hash-web-server',
-  path.join(root, 'web_server.py'),
-]);
-
-run(venvPython, [
-  '-m',
-  'PyInstaller',
-  '--noconfirm',
-  '--clean',
-  '--distpath',
-  pythonDist,
-  '--workpath',
-  proxyWork,
-  '--specpath',
-  proxyWork,
-  '--name',
-  'hash-proxy-server',
-  path.join(root, 'proxy_server.py'),
-]);
+run(venvPython, pyInstallerArgs('hash-web-server', path.join(root, 'web_server.py'), webWork));
+run(venvPython, pyInstallerArgs('hash-proxy-server', path.join(root, 'proxy_server.py'), proxyWork));

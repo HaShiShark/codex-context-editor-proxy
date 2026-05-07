@@ -162,10 +162,20 @@ function pythonCommand(root) {
 }
 
 function pythonServerCommand(root, scriptName, exeName) {
-  const executableName = process.platform === 'win32' ? `${exeName}.exe` : exeName;
-  const bundledExecutable = path.join(root, 'python_dist', exeName, executableName);
-  if (fs.existsSync(bundledExecutable)) {
-    return { command: bundledExecutable, args: [] };
+  const candidates = process.platform === 'win32'
+    ? [
+        path.join(root, 'python_dist', exeName, `${exeName}.exe`),
+        path.join(root, 'python_dist', `${exeName}.exe`),
+      ]
+    : [
+        path.join(root, 'python_dist', exeName),
+        path.join(root, 'python_dist', exeName, exeName),
+      ];
+
+  for (const bundledExecutable of candidates) {
+    if (fs.existsSync(bundledExecutable)) {
+      return { command: bundledExecutable, args: [] };
+    }
   }
 
   return { command: pythonCommand(root), args: [scriptName] };
