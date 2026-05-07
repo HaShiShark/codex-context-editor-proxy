@@ -36,7 +36,7 @@
     "pack:win": "npm run build:react && npm run build:python && electron-builder --win --dir",
     "dist:win": "npm run build:react && npm run build:python && electron-builder --win nsis",
     "pack:mac": "npm run build:react && npm run build:python && electron-builder --mac --dir",
-    "dist:mac": "npm run build:react && npm run build:python && electron-builder --mac"
+    "dist:mac": "npm run build:react && npm run build:python && electron-builder --mac --publish never"
   },
   "dependencies": {
     "highlight.js": "^11.11.1",
