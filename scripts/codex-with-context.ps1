@@ -55,11 +55,20 @@ function Start-ContextWindow {
     return Start-Process -FilePath $packagedExe -WindowStyle Hidden -PassThru
   }
 
-  return Start-Process -FilePath "npm.cmd" -ArgumentList @("run", "window") -WorkingDirectory $root.Path -WindowStyle Hidden -PassThru
+  $logDir = Join-Path $root.Path "logs"
+  New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+  return Start-Process `
+    -FilePath "npm.cmd" `
+    -ArgumentList @("run", "window") `
+    -WorkingDirectory $root.Path `
+    -WindowStyle Hidden `
+    -RedirectStandardOutput (Join-Path $logDir "electron-window.stdout.log") `
+    -RedirectStandardError (Join-Path $logDir "electron-window.stderr.log") `
+    -PassThru
 }
 
 $hookCommand = (Join-Path $root "scripts\codex-context-hook.cmd").Replace("\", "/")
-$hookConfig = "hooks.UserPromptSubmit=[{matcher='*',hooks=[{type='command',command='$hookCommand',timeout=5,statusMessage='HashContext'}]}]"
+$hookConfig = "hooks.UserPromptSubmit=[{matcher='*',hooks=[{type='command',command='$hookCommand',timeout=10,statusMessage='HashContext'}]}]"
 
 $configArgs = @(
   "-c", "model_providers.hash-context.name=Hash Context",
@@ -68,7 +77,7 @@ $configArgs = @(
   "-c", "model_providers.hash-context.wire_api=responses",
   "-c", "model_providers.hash-context.supports_websockets=false",
   "-c", "model_provider=hash-context",
-  "-c", "features.codex_hooks=true",
+  "-c", "features.hooks=true",
   "-c", $hookConfig
 )
 
@@ -93,6 +102,23 @@ function Test-HttpOk {
   }
 }
 
+function Test-TcpPortOpen {
+  param([int] $Port)
+  $client = [System.Net.Sockets.TcpClient]::new()
+  try {
+    $async = $client.BeginConnect("127.0.0.1", $Port, $null, $null)
+    if (-not $async.AsyncWaitHandle.WaitOne(500)) {
+      return $false
+    }
+    $client.EndConnect($async)
+    return $true
+  } catch {
+    return $false
+  } finally {
+    $client.Close()
+  }
+}
+
 function Wait-HttpOk {
   param(
     [string] $Name,
@@ -108,6 +134,23 @@ function Wait-HttpOk {
     Start-Sleep -Milliseconds 500
   }
   throw "$Name did not become ready: $Url"
+}
+
+function Wait-TcpPortOpen {
+  param(
+    [string] $Name,
+    [int] $Port,
+    [int] $TimeoutSeconds = 30
+  )
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  while ((Get-Date) -lt $deadline) {
+    if (Test-TcpPortOpen -Port $Port) {
+      Write-Host "[ok] $Name -> 127.0.0.1:$Port" -ForegroundColor Green
+      return
+    }
+    Start-Sleep -Milliseconds 500
+  }
+  throw "$Name did not become ready: 127.0.0.1:$Port"
 }
 
 function ConvertTo-FullPath {
@@ -204,8 +247,8 @@ if ($null -eq $previousControlPort) {
 }
 Write-Host "[hash-context] launcher pid: $($windowProcess.Id)"
 
-Wait-HttpOk -Name "proxy" -Url "http://127.0.0.1:$proxyPort/api/proxy/sessions"
-Wait-HttpOk -Name "backend" -Url "http://127.0.0.1:8765/api/init"
+Wait-TcpPortOpen -Name "proxy" -Port ([int] $proxyPort)
+Wait-TcpPortOpen -Name "backend" -Port 8765
 if ($usesPackagedWindow) {
   Wait-HttpOk -Name "frontend" -Url "http://127.0.0.1:8765/react/"
 } else {
@@ -216,6 +259,7 @@ Wait-HttpOk -Name "window-control" -Url "http://127.0.0.1:$controlPort/health"
 Write-Host "[hash-context] starting Codex through local proxy..." -ForegroundColor Cyan
 Write-Host "[hash-context] base_url=http://127.0.0.1:$proxyPort/v1"
 Write-Host "[hash-context] type context or ctx inside Codex to open the workbench"
+Write-Host "[hash-context] if Codex says hooks need review, run /hooks and approve HashContext once"
 Write-Host "[hash-context] logs: $($root.Path)\logs\electron-window.log"
 Write-Host ""
 

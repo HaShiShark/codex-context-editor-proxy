@@ -162,6 +162,13 @@ function pythonCommand(root) {
 }
 
 function pythonServerCommand(root, scriptName, exeName) {
+  const preferSource =
+    process.env.HASH_CONTEXT_PREFER_SOURCE_SERVERS === '1' ||
+    (!app.isPackaged && process.env.HASH_CONTEXT_USE_BUNDLED_PYTHON !== '1');
+  if (preferSource) {
+    return { command: pythonCommand(root), args: [scriptName] };
+  }
+
   const candidates = process.platform === 'win32'
     ? [
         path.join(root, 'python_dist', exeName, `${exeName}.exe`),

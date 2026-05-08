@@ -141,6 +141,48 @@ function Sync-LocalCodexSession {
   }
 }
 
+function Start-LocalCodexSessionSync {
+  param(
+    [string] $SessionId
+  )
+
+  if (-not $SessionId) {
+    return
+  }
+
+  try {
+    $root = Resolve-Path (Join-Path $PSScriptRoot "..")
+    $logDir = Join-Path $root "logs"
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $logPath = Join-Path $logDir "codex-context-hook.log"
+    $escapedSessionId = $SessionId.Replace("'", "''")
+    $escapedLogPath = $logPath.Replace("'", "''")
+    $script = @"
+`$ErrorActionPreference = "Stop"
+function Write-BackgroundLog {
+  param([string] `$Message)
+  try {
+    Add-Content -Path '$escapedLogPath' -Value "`$((Get-Date).ToUniversalTime().ToString("o")) `$Message" -Encoding UTF8
+  } catch {
+  }
+}
+`$sessionId = '$escapedSessionId'
+try {
+  `$payload = @{ session_id = `$sessionId; title = "Codex `$(`$sessionId.Substring(0, 8))" } | ConvertTo-Json -Compress
+  Invoke-WebRequest -Uri "http://127.0.0.1:8765/api/codex-local-session-sync" -Method Post -Body `$payload -ContentType "application/json" -UseBasicParsing -TimeoutSec 20 | Out-Null
+  Write-BackgroundLog "local-session-sync ok session_id=`$sessionId"
+} catch {
+  Write-BackgroundLog "local-session-sync failed session_id=`$sessionId error=`$(`$_.Exception.Message)"
+}
+"@
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($script))
+    Start-Process -FilePath "powershell" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encoded) -WindowStyle Hidden | Out-Null
+    Write-HookLog "local-session-sync started session_id=$SessionId"
+  } catch {
+    Write-HookLog "local-session-sync start failed session_id=$SessionId error=$($_.Exception.Message)"
+  }
+}
+
 function Consume-ContextEditMarker {
   param(
     [string] $SessionId
@@ -220,21 +262,27 @@ try {
   if (-not $sessionId) {
     $sessionId = Find-LatestHistorySessionId -Prompt $prompt
   }
-  Sync-LocalCodexSession -SessionId $sessionId
   $showUrl = "http://127.0.0.1:$controlPort/show"
   if ($sessionId) {
     $showUrl = "$showUrl`?session_id=$([uri]::EscapeDataString($sessionId))"
   }
   Invoke-WebRequest -Uri $showUrl -Method Post -UseBasicParsing -TimeoutSec 2 | Out-Null
+  Write-HookLog "show ok session_id=$sessionId"
+  Start-LocalCodexSessionSync -SessionId $sessionId
   Write-HookJson @{
     continue = $false
+    decision = "block"
+    reason = "Opened Hash Context Workbench"
     suppressOutput = $true
     stopReason = "Opened Hash Context Workbench"
   }
 } catch {
+  $reason = "Hash Context Workbench is not running: $($_.Exception.Message)"
   Write-HookJson @{
     continue = $false
+    decision = "block"
+    reason = $reason
     suppressOutput = $false
-    stopReason = "Hash Context Workbench is not running: $($_.Exception.Message)"
+    stopReason = $reason
   }
 }

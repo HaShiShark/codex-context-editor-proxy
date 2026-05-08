@@ -13,6 +13,7 @@ $statePath = Join-Path $stateDir "codex-desktop-proxy.json"
 $backupDir = Join-Path $stateDir "backups"
 $proxyPort = if ($env:HASH_CONTEXT_PROXY_PORT) { $env:HASH_CONTEXT_PROXY_PORT } else { "8787" }
 $controlPort = if ($env:HASH_CONTEXT_CONTROL_PORT) { $env:HASH_CONTEXT_CONTROL_PORT } else { "8790" }
+$desktopDataDir = if ($env:HASH_CONTEXT_DESKTOP_DATA_DIR) { $env:HASH_CONTEXT_DESKTOP_DATA_DIR } else { Join-Path $env:APPDATA "hash-context-codex-lab\data" }
 
 $topBegin = "# BEGIN HASH_CONTEXT_DESKTOP_TOP"
 $topEnd = "# END HASH_CONTEXT_DESKTOP_TOP"
@@ -39,28 +40,48 @@ function Save-DesktopState {
 function Get-ProxySnapshot {
   $sessionCount = 0
   $activeSessionId = ""
-  $proxyStatePath = Join-Path $projectRoot.Path "data\proxy_state.json"
-  if (Test-Path $proxyStatePath) {
+  $dataDir = $desktopDataDir
+  if (-not (Test-Path $dataDir)) {
+    $dataDir = Join-Path $projectRoot.Path "data"
+  }
+  $logPath = Join-Path $dataDir "proxy.log"
+  $logLength = 0
+  if (Test-Path $logPath) {
+    $logLength = (Get-Item $logPath).Length
     try {
-      $raw = Get-Content -Raw -Path $proxyStatePath | ConvertFrom-Json
-      if ($raw.sessions) {
-        $sessionCount = @($raw.sessions).Count
+      $sessionIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+      foreach ($line in Get-Content -Path $logPath -ErrorAction Stop) {
+        $match = [regex]::Match($line, "request session=([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
+        if ($match.Success) {
+          $activeSessionId = $match.Groups[1].Value.ToLowerInvariant()
+          [void] $sessionIds.Add($activeSessionId)
+        }
       }
-      $activeSessionId = [string] $raw.active_session_id
+      $sessionCount = $sessionIds.Count
     } catch {
     }
   }
 
-  $logPath = Join-Path $projectRoot.Path "data\proxy.log"
-  $logLength = 0
-  if (Test-Path $logPath) {
-    $logLength = (Get-Item $logPath).Length
+  $proxyStatePath = Join-Path $dataDir "proxy_state.json"
+  if (-not $activeSessionId -and (Test-Path $proxyStatePath)) {
+    try {
+      $head = Get-Content -Path $proxyStatePath -TotalCount 5 -ErrorAction Stop
+      foreach ($line in $head) {
+        $match = [regex]::Match($line, '^\s*"active_session_id"\s*:\s*"([^"]*)"')
+        if ($match.Success) {
+          $activeSessionId = [string] $match.Groups[1].Value
+          break
+        }
+      }
+    } catch {
+    }
   }
 
   return @{
     session_count = $sessionCount
     active_session_id = $activeSessionId
     proxy_log_length = $logLength
+    data_dir = $dataDir
   }
 }
 
@@ -129,8 +150,8 @@ function Get-TopBlock {
   return @"
 $topBegin
 model_provider = "hash-context"
-features.codex_hooks = true
-hooks.UserPromptSubmit = [{ matcher = "*", hooks = [{ type = "command", command = $hookCommand, timeout = 5, statusMessage = "HashContext" }] }]
+features.hooks = true
+hooks.UserPromptSubmit = [{ matcher = "*", hooks = [{ type = "command", command = $hookCommand, timeout = 10, statusMessage = "HashContext" }] }]
 $topEnd
 "@
 }
@@ -187,6 +208,7 @@ function Set-DesktopConfigEnabled {
     project_root = $projectRoot.Path
     proxy_port = $proxyPort
     control_port = $controlPort
+    data_dir = $snapshot.data_dir
     session_count_before = $snapshot.session_count
     proxy_log_length_before = $snapshot.proxy_log_length
     updated_at = (Get-Date).ToUniversalTime().ToString("o")
@@ -240,6 +262,85 @@ function Test-HttpOk {
   }
 }
 
+function Test-TcpPortOpen {
+  param([int] $Port)
+  $client = [System.Net.Sockets.TcpClient]::new()
+  try {
+    $async = $client.BeginConnect("127.0.0.1", $Port, $null, $null)
+    if (-not $async.AsyncWaitHandle.WaitOne(500)) {
+      return $false
+    }
+    $client.EndConnect($async)
+    return $true
+  } catch {
+    return $false
+  } finally {
+    $client.Close()
+  }
+}
+
+function Get-ProjectPortOwners {
+  param([int[]] $Ports)
+
+  $owners = @()
+  foreach ($port in $Ports) {
+    $connections = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
+    foreach ($connection in $connections) {
+      $ownerPid = [int] $connection.OwningProcess
+      $process = Get-CimInstance Win32_Process -Filter "ProcessId=$ownerPid" -ErrorAction SilentlyContinue
+      if (-not $process) {
+        continue
+      }
+      $commandLine = [string] $process.CommandLine
+      if ($commandLine -and (
+          $commandLine.Contains($projectRoot.Path) -or
+          $commandLine -like "*proxy_server.py*" -or
+          $commandLine -like "*web_server.py*" -or
+          $commandLine -like "*hash-proxy-server*" -or
+          $commandLine -like "*hash-web-server*" -or
+          $commandLine -like "*electron/context-window.cjs*" -or
+          $commandLine -like "*react_app\vite.config.ts*"
+        )) {
+        $owners += [pscustomobject] @{
+          Port = $port
+          Pid = $ownerPid
+          Name = [string] $process.Name
+          CommandLine = $commandLine
+        }
+      }
+    }
+  }
+  return $owners
+}
+
+function Stop-ProjectServicePorts {
+  param([string] $Reason)
+
+  $ports = @([int] $proxyPort, 8765, [int] $controlPort, 5174)
+  $owners = Get-ProjectPortOwners -Ports $ports | Sort-Object Pid -Unique
+  foreach ($owner in $owners) {
+    try {
+      Stop-Process -Id ([int] $owner.Pid) -Force -ErrorAction Stop
+      Write-Host "[hash-context] stopped service pid=$($owner.Pid) port=$($owner.Port) reason=$Reason"
+    } catch {
+      Write-Host "[hash-context] could not stop service pid=$($owner.Pid): $($_.Exception.Message)" -ForegroundColor DarkYellow
+    }
+  }
+  if ($owners.Count -gt 0) {
+    Start-Sleep -Milliseconds 800
+  }
+}
+
+function Test-SourceProxyRunning {
+  $owners = Get-ProjectPortOwners -Ports @([int] $proxyPort)
+  foreach ($owner in $owners) {
+    if ($owner.CommandLine -like "*proxy_server.py*") {
+      return $true
+    }
+  }
+  return $false
+}
+
 function Get-PackagedWindowExe {
   $installRoot = [System.IO.Path]::GetFullPath((Join-Path $projectRoot.Path "..\.."))
   $candidates = @(
@@ -260,7 +361,16 @@ function Start-ContextWindow {
     return Start-Process -FilePath $packagedExe -WindowStyle Hidden -PassThru
   }
 
-  return Start-Process -FilePath "npm.cmd" -ArgumentList @("run", "window") -WorkingDirectory $projectRoot.Path -WindowStyle Hidden -PassThru
+  $logDir = Join-Path $projectRoot.Path "logs"
+  New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+  return Start-Process `
+    -FilePath "npm.cmd" `
+    -ArgumentList @("run", "window") `
+    -WorkingDirectory $projectRoot.Path `
+    -WindowStyle Hidden `
+    -RedirectStandardOutput (Join-Path $logDir "electron-window.stdout.log") `
+    -RedirectStandardError (Join-Path $logDir "electron-window.stderr.log") `
+    -PassThru
 }
 
 function Wait-HttpOk {
@@ -278,6 +388,23 @@ function Wait-HttpOk {
     Start-Sleep -Milliseconds 500
   }
   throw "$Name did not become ready: $Url"
+}
+
+function Wait-TcpPortOpen {
+  param(
+    [string] $Name,
+    [int] $Port,
+    [int] $TimeoutSeconds = 30
+  )
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  while ((Get-Date) -lt $deadline) {
+    if (Test-TcpPortOpen -Port $Port) {
+      Write-Host "[ok] $Name -> 127.0.0.1:$Port" -ForegroundColor Green
+      return
+    }
+    Start-Sleep -Milliseconds 500
+  }
+  throw "$Name did not become ready: 127.0.0.1:$Port"
 }
 
 function Stop-CodexProcesses {
@@ -319,6 +446,7 @@ function Test-DesktopConfigInstalled {
       $text.Contains($topBegin) -and
       $text.Contains($providerBegin) -and
       $text.Contains('model_provider = "hash-context"') -and
+      $text.Contains('features.hooks = true') -and
       ($text.Contains("http://localhost:$proxyPort/v1") -or $text.Contains("http://127.0.0.1:$proxyPort/v1"))
     )
   } catch {
@@ -327,8 +455,14 @@ function Test-DesktopConfigInstalled {
 }
 
 function Start-DesktopServices {
-  if ((Test-HttpOk "http://127.0.0.1:$proxyPort/api/proxy/sessions") -and
-      (Test-HttpOk "http://127.0.0.1:8765/api/init") -and
+  if ($env:HASH_CONTEXT_USE_BUNDLED_PYTHON -ne "1" -and
+      (Test-TcpPortOpen -Port ([int] $proxyPort)) -and
+      -not (Test-SourceProxyRunning)) {
+    Stop-ProjectServicePorts -Reason "refresh source proxy"
+  }
+
+  if ((Test-TcpPortOpen -Port ([int] $proxyPort)) -and
+      (Test-TcpPortOpen -Port 8765) -and
       (Test-HttpOk "http://127.0.0.1:$controlPort/health")) {
     Write-Host "[hash-context] desktop services already running"
     return 0
@@ -336,8 +470,12 @@ function Start-DesktopServices {
 
   $previousStartHidden = $env:HASH_CONTEXT_START_HIDDEN
   $previousControlPort = $env:HASH_CONTEXT_CONTROL_PORT
+  $previousPreferSource = $env:HASH_CONTEXT_PREFER_SOURCE_SERVERS
   $env:HASH_CONTEXT_START_HIDDEN = "1"
   $env:HASH_CONTEXT_CONTROL_PORT = $controlPort
+  if ($null -eq $previousPreferSource -and $env:HASH_CONTEXT_USE_BUNDLED_PYTHON -ne "1") {
+    $env:HASH_CONTEXT_PREFER_SOURCE_SERVERS = "1"
+  }
   $process = Start-ContextWindow
   if ($null -eq $previousStartHidden) {
     Remove-Item Env:\HASH_CONTEXT_START_HIDDEN -ErrorAction SilentlyContinue
@@ -349,9 +487,14 @@ function Start-DesktopServices {
   } else {
     $env:HASH_CONTEXT_CONTROL_PORT = $previousControlPort
   }
+  if ($null -eq $previousPreferSource) {
+    Remove-Item Env:\HASH_CONTEXT_PREFER_SOURCE_SERVERS -ErrorAction SilentlyContinue
+  } else {
+    $env:HASH_CONTEXT_PREFER_SOURCE_SERVERS = $previousPreferSource
+  }
 
-  Wait-HttpOk -Name "proxy" -Url "http://127.0.0.1:$proxyPort/api/proxy/sessions"
-  Wait-HttpOk -Name "backend" -Url "http://127.0.0.1:8765/api/init"
+  Wait-TcpPortOpen -Name "proxy" -Port ([int] $proxyPort)
+  Wait-TcpPortOpen -Name "backend" -Port 8765
   Wait-HttpOk -Name "window-control" -Url "http://127.0.0.1:$controlPort/health"
   return $process.Id
 }
@@ -373,6 +516,7 @@ function Update-ServicePid {
     project_root = [string] $state.project_root
     proxy_port = [string] $state.proxy_port
     control_port = [string] $state.control_port
+    data_dir = if ($state.data_dir) { [string] $state.data_dir } else { $desktopDataDir }
     session_count_before = [int] $state.session_count_before
     proxy_log_length_before = [int64] $state.proxy_log_length_before
     updated_at = (Get-Date).ToUniversalTime().ToString("o")
@@ -400,9 +544,16 @@ function Show-DesktopStatus {
   Write-Host "[hash-context] desktop proxy: $(if ($enabled) { 'on' } else { 'off' })"
   Write-Host "[hash-context] config: $configPath"
   Write-Host "[hash-context] config blocks: $(if (Test-DesktopConfigInstalled) { 'installed' } else { 'missing' })"
-  Write-Host "[hash-context] services proxy: $(if (Test-HttpOk "http://127.0.0.1:$proxyPort/api/proxy/sessions") { 'ready' } else { 'not ready' })"
-  Write-Host "[hash-context] services backend: $(if (Test-HttpOk "http://127.0.0.1:8765/api/init") { 'ready' } else { 'not ready' })"
+  if (Test-Path $configPath) {
+    $configText = Get-Content -Raw -Path $configPath
+    if ($configText.Contains('features.codex_hooks = true')) {
+      Write-Host "[hash-context] config warning: features.codex_hooks is deprecated; use features.hooks" -ForegroundColor DarkYellow
+    }
+  }
+  Write-Host "[hash-context] services proxy: $(if (Test-TcpPortOpen -Port ([int] $proxyPort)) { 'ready' } else { 'not ready' })"
+  Write-Host "[hash-context] services backend: $(if (Test-TcpPortOpen -Port 8765) { 'ready' } else { 'not ready' })"
   Write-Host "[hash-context] services control: $(if (Test-HttpOk "http://127.0.0.1:$controlPort/health") { 'ready' } else { 'not ready' })"
+  Write-Host "[hash-context] data dir: $($snapshot.data_dir)"
   Write-Host "[hash-context] sessions before/current: $beforeSessions/$($snapshot.session_count)"
   Write-Host "[hash-context] proxy log bytes before/current: $beforeLog/$($snapshot.proxy_log_length)"
   if ($state -and $state.backup_path) {
@@ -422,6 +573,7 @@ switch ($Command) {
     Update-ServicePid -ServiceProcessId $serviceProcessId
     Write-Host "[hash-context] desktop probe is armed"
     Write-Host "[hash-context] keep this desktop app open; use a fresh chat for testing, then run: codex ctx desktop status"
+    Write-Host "[hash-context] if Codex says hooks need review, run /hooks and approve HashContext once"
     Write-Host "[hash-context] restore with: codex ctx desktop off"
     break
   }
@@ -432,6 +584,7 @@ switch ($Command) {
     Update-ServicePid -ServiceProcessId $serviceProcessId
     Write-Host "[hash-context] desktop proxy on"
     Write-Host "[hash-context] keep this desktop app open; use a fresh chat for testing"
+    Write-Host "[hash-context] if Codex says hooks need review, run /hooks and approve HashContext once"
     break
   }
   "off" {

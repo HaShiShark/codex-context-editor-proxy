@@ -36,6 +36,9 @@ CODEX_PROXY_PROVIDER_ID = "codex-proxy"
 CODEX_PROXY_BASE_URL = f"http://{HOST}:{PORT}/v1"
 INTERNAL_CONTEXT_HEADER = "x-hash-context-internal"
 INTERNAL_CONTEXT_VALUE = "context-workbench"
+CONTEXT_CONTROL_COMMANDS = {"ctx", "/ctx", "context", "/context"}
+CONTEXT_CONTROL_NOTICE_TEXT = "Hash Context: opened workbench."
+CONTROL_PORT = int(os.environ.get("HASH_CONTEXT_CONTROL_PORT", "8790"))
 LOCAL_COMPACT_PROMPT_PREFIX = "You are performing a CONTEXT CHECKPOINT COMPACTION."
 LOCAL_COMPACT_SUMMARY_PREFIX = (
     "Another language model started to solve this problem and produced a summary of its thinking process. "
@@ -504,6 +507,20 @@ def input_items_to_transcript(input_items: Any) -> list[dict[str, Any]]:
     return records
 
 
+def is_context_control_command_text(text: str) -> bool:
+    return str(text or "").strip().lower() in CONTEXT_CONTROL_COMMANDS
+
+
+def context_control_command_from_input(input_items: Any) -> str:
+    transcript = input_items_to_transcript(input_items)
+    for record in reversed(transcript):
+        if str(record.get("role") or "").strip() != "user":
+            continue
+        text = compact_text(record.get("text") or "").strip()
+        return text if is_context_control_command_text(text) else ""
+    return ""
+
+
 def transcript_to_input_items(transcript: list[dict[str, Any]]) -> list[dict[str, Any]]:
     input_items: list[dict[str, Any]] = []
     for record in transcript:
@@ -917,6 +934,24 @@ def has_effective_upstream_auth(headers: dict[str, str]) -> bool:
     return _has_usable_auth(apply_cached_upstream_auth(headers))
 
 
+def open_context_workbench(session_id: str) -> tuple[bool, str]:
+    path = "/show"
+    if session_id:
+        path = f"{path}?session_id={urllib.parse.quote(session_id, safe='')}"
+    conn = http.client.HTTPConnection("127.0.0.1", CONTROL_PORT, timeout=2)
+    try:
+        conn.request("POST", path, body=b"", headers={"Content-Length": "0"})
+        response = conn.getresponse()
+        preview = response.read(1000).decode("utf-8", errors="replace")
+        if 200 <= response.status < 300:
+            return True, ""
+        return False, f"window-control returned {response.status}: {preview}"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    finally:
+        conn.close()
+
+
 def is_internal_context_request(headers: dict[str, str], body: dict[str, Any] | None = None) -> bool:
     if str(headers.get(INTERNAL_CONTEXT_HEADER) or "").strip() == INTERNAL_CONTEXT_VALUE:
         return True
@@ -1026,6 +1061,11 @@ def is_context_edit_notice_text(text: str) -> bool:
     return compact.startswith("Hash Context: context has been edited")
 
 
+def is_context_control_notice_text(text: str) -> bool:
+    compact = " ".join(str(text or "").split()).strip()
+    return compact == CONTEXT_CONTROL_NOTICE_TEXT
+
+
 def remove_context_edit_notice_prefix(text: str) -> str:
     raw_text = str(text or "")
     if not is_context_edit_notice_text(raw_text):
@@ -1039,11 +1079,18 @@ def remove_context_edit_notice_prefix(text: str) -> str:
 def strip_context_edit_notice_records(transcript: list[dict[str, Any]]) -> list[dict[str, Any]]:
     next_transcript: list[dict[str, Any]] = []
     for record in transcript:
-        if str(record.get("role") or "").strip() != "assistant":
+        role = str(record.get("role") or "").strip()
+        text = compact_text(record.get("text") or "")
+        if role == "user" and is_context_control_command_text(text):
+            continue
+
+        if role != "assistant":
             next_transcript.append(record)
             continue
 
-        text = compact_text(record.get("text") or "")
+        if is_context_control_notice_text(text):
+            continue
+
         if not is_context_edit_notice_text(text):
             next_transcript.append(record)
             continue
@@ -1356,6 +1403,33 @@ class ProxyStore:
             session.request_log = session.request_log[-20:]
             self.save()
             return session, request_body
+
+    def record_control_intercept(self, session_id: str, body: dict[str, Any], headers: dict[str, str], command: str) -> ProxySession:
+        with self.lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                session = ProxySession(id=session_id, title=f"Codex {session_id[:8]}")
+                self.sessions[session_id] = session
+            source_transcript = strip_context_edit_notice_records(input_items_to_transcript(body.get("input")))
+            session.transcript = clean_transcript(source_transcript)
+            session.pending_transcript = None
+            session.local_compact_source_transcript = None
+            session.status = "override" if session.edited_transcript is not None else "mirror"
+            session.last_error = ""
+            session.updated_at = utc_timestamp()
+            self.active_session_id = session_id
+            session.request_log.append(
+                {
+                    "created_at": session.updated_at,
+                    "kind": "context_control_intercept",
+                    "command": command,
+                    "headers": {key: value for key, value in headers.items() if key.lower().startswith("x-")},
+                    "body": body,
+                }
+            )
+            session.request_log = session.request_log[-20:]
+            self.save()
+            return session
 
     def begin_compact(self, session_id: str, body: dict[str, Any], headers: dict[str, str]) -> tuple[ProxySession, dict[str, Any]]:
         request_body = copy.deepcopy(body)
@@ -1817,6 +1891,37 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
+    def _send_sse_event(self, event: dict[str, Any]) -> None:
+        event_type = str(event.get("type") or "message")
+        payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+        self.wfile.write(f"event: {event_type}\n".encode("utf-8"))
+        self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+        self.wfile.flush()
+
+    def _send_context_control_response(self, body: dict[str, Any], opened: bool, error: str = "") -> None:
+        response_id = f"resp_hash_context_{uuid.uuid4().hex}"
+        message_id = f"msg_hash_context_{uuid.uuid4().hex}"
+        model = str(body.get("model") or "gpt-5.5")
+        text = CONTEXT_CONTROL_NOTICE_TEXT if opened else f"Hash Context: workbench unavailable. {error}".strip()
+        item = {
+            "type": "message",
+            "role": "assistant",
+            "id": message_id,
+            "content": [{"type": "output_text", "text": text}],
+        }
+        self.send_response(HTTPStatus.OK)
+        self._send_cors_headers()
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self._send_sse_event({"type": "response.created", "response": {"id": response_id, "model": model}})
+        self._send_sse_event({"type": "response.output_item.added", "output_index": 0, "item": {**item, "content": [{"type": "output_text", "text": ""}]}})
+        self._send_sse_event({"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "item_id": message_id, "delta": text})
+        self._send_sse_event({"type": "response.output_item.done", "output_index": 0, "item": item})
+        self._send_sse_event({"type": "response.completed", "response": {"id": response_id, "model": model, "output": [item]}})
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
     def _handle_responses(self) -> None:
         raw_body = self.rfile.read(int(self.headers.get("Content-Length", "0") or "0"))
         proxy_log(f"responses body bytes={len(raw_body)} prefix={raw_body[:80]!r}")
@@ -1833,6 +1938,18 @@ class Handler(BaseHTTPRequestHandler):
 
         headers = {key.lower(): value for key, value in self.headers.items()}
         is_internal_context = is_internal_context_request(headers, body)
+        if not is_internal_context:
+            control_command = context_control_command_from_input(body.get("input"))
+            if control_command:
+                session_id = session_id_for_request(body, headers)
+                STORE.record_control_intercept(session_id, body, headers, control_command)
+                opened, error = open_context_workbench(session_id)
+                proxy_log(
+                    f"context control intercepted session={session_id} command={control_command!r} "
+                    f"opened={opened} error={error!r}"
+                )
+                self._send_context_control_response(body, opened, error)
+                return
         if is_internal_context and not has_effective_upstream_auth(headers):
             proxy_log("internal context request missing cached upstream auth")
             self._send_json(
