@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
 
-const HOST = '127.0.0.1';
+const HOST = process.env.HASH_CONTEXT_HOST || 'localhost';
 const BACKEND_PORT = 8765;
 const FRONTEND_PORT = 5174;
 const PROXY_PORT = 8787;
@@ -228,7 +228,7 @@ async function startBackend(root) {
     writeLog(`[backend:error] ${chunk.toString().trim()}`);
   });
 
-  await waitFor(BACKEND_PORT, '/api/init', 'Backend');
+  await waitFor(BACKEND_PORT, '/api/init', 'Backend', 90000);
   writeLog('backend ready');
 }
 

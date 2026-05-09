@@ -32,7 +32,7 @@ SETTINGS_FILE = DATA_DIR / "openai_settings.json"
 LEGACY_SETTINGS_FILE = LEGACY_DATA_DIR / "openai_settings.json"
 CODEX_PROXY_PROVIDER_ID = "codex-proxy"
 CODEX_PROXY_BASE_URL = (
-    f"http://{os.getenv('HASH_CONTEXT_PROXY_HOST', '127.0.0.1')}:"
+    f"http://{os.getenv('HASH_CONTEXT_PROXY_HOST', os.getenv('HASH_CONTEXT_HOST', 'localhost'))}:"
     f"{os.getenv('HASH_CONTEXT_PROXY_PORT', '8787')}/v1"
 )
 DEFAULT_CODEX_PROXY_MODELS: tuple[dict[str, str], ...] = (

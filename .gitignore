@@ -1,4 +1,5 @@
 node_modules/
+.claude/
 release/
 python_dist/
 .venv/

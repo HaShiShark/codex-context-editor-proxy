@@ -26,6 +26,8 @@ import { normalizeConversation, normalizeReasoningOptions } from './utils';
 const DEMO_SESSION_ID = 'hash-context-preview';
 const LIVE_REFRESH_IDLE_MS = 1600;
 const LIVE_REFRESH_RUNNING_MS = 800;
+const PENDING_CONTEXT_REFRESH_MS = 200;
+const PENDING_CONTEXT_REFRESH_MAX_MS = 5000;
 const LOCAL_EDIT_GRACE_MS = 1500;
 const MIN_WORKBENCH_WINDOW_WIDTH = 760;
 const MIN_WORKBENCH_WINDOW_HEIGHT = 520;
@@ -53,6 +55,19 @@ const WINDOW_RESIZE_EDGES: WindowResizeEdge[] = [
 
 function isProxyBusy(status?: string, isRunning?: boolean): boolean {
   return Boolean(isRunning || status === 'running' || status === 'compacting');
+}
+
+function hasPendingAssistantMessage(messages: MessageRecord[]): boolean {
+  const lastAssistant = [...messages].reverse().find((message) => message.role === 'an');
+  if (!lastAssistant) {
+    return false;
+  }
+
+  return Boolean(
+    lastAssistant.pending
+    || (!lastAssistant.text.trim() && lastAssistant.blocks.some((block) => block.kind === 'thinking'))
+    || lastAssistant.blocks.some((block) => block.kind === 'reasoning' && block.status === 'streaming'),
+  );
 }
 
 type LoadInitOptions = {
@@ -530,6 +545,28 @@ export default function WorkbenchWindow() {
   );
 
   const currentPendingRestore = sessionId ? pendingRestores[sessionId] || null : null;
+  const hasPendingAssistant = useMemo(() => hasPendingAssistantMessage(messages), [messages]);
+
+  useEffect(() => {
+    if (!hasPendingAssistant) {
+      return undefined;
+    }
+
+    const startedAt = Date.now();
+    const intervalId = window.setInterval(() => {
+      if (Date.now() - startedAt >= PENDING_CONTEXT_REFRESH_MAX_MS) {
+        window.clearInterval(intervalId);
+        return;
+      }
+      if (Date.now() - lastLocalEditAtRef.current < LOCAL_EDIT_GRACE_MS) {
+        return;
+      }
+
+      void loadInit({ silent: true });
+    }, PENDING_CONTEXT_REFRESH_MS);
+
+    return () => window.clearInterval(intervalId);
+  }, [hasPendingAssistant, loadInit]);
 
   const commitContextConversation = useCallback(
     async (
