@@ -13,6 +13,8 @@ $statePath = Join-Path $stateDir "codex-desktop-proxy.json"
 $backupDir = Join-Path $stateDir "backups"
 $proxyPort = if ($env:HASH_CONTEXT_PROXY_PORT) { $env:HASH_CONTEXT_PROXY_PORT } else { "8787" }
 $controlPort = if ($env:HASH_CONTEXT_CONTROL_PORT) { $env:HASH_CONTEXT_CONTROL_PORT } else { "8790" }
+$loopbackHost = if ($env:HASH_CONTEXT_HOST) { $env:HASH_CONTEXT_HOST } else { "localhost" }
+$serviceProbeHost = if ($loopbackHost -eq "localhost") { "127.0.0.1" } else { $loopbackHost }
 $desktopDataDir = if ($env:HASH_CONTEXT_DESKTOP_DATA_DIR) { $env:HASH_CONTEXT_DESKTOP_DATA_DIR } else { Join-Path $env:APPDATA "hash-context-codex-lab\data" }
 
 $topBegin = "# BEGIN HASH_CONTEXT_DESKTOP_TOP"
@@ -161,7 +163,7 @@ function Get-ProviderBlock {
 $providerBegin
 [model_providers.hash-context]
 name = "Hash Context"
-base_url = "http://localhost:$proxyPort/v1"
+base_url = "http://${loopbackHost}:$proxyPort/v1"
 requires_openai_auth = true
 wire_api = "responses"
 supports_websockets = false
@@ -266,7 +268,7 @@ function Test-TcpPortOpen {
   param([int] $Port)
   $client = [System.Net.Sockets.TcpClient]::new()
   try {
-    $async = $client.BeginConnect("127.0.0.1", $Port, $null, $null)
+    $async = $client.BeginConnect("$loopbackHost", $Port, $null, $null)
     if (-not $async.AsyncWaitHandle.WaitOne(500)) {
       return $false
     }
@@ -399,12 +401,12 @@ function Wait-TcpPortOpen {
   $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
   while ((Get-Date) -lt $deadline) {
     if (Test-TcpPortOpen -Port $Port) {
-      Write-Host "[ok] $Name -> 127.0.0.1:$Port" -ForegroundColor Green
+      Write-Host "[ok] $Name -> ${loopbackHost}:$Port" -ForegroundColor Green
       return
     }
     Start-Sleep -Milliseconds 500
   }
-  throw "$Name did not become ready: 127.0.0.1:$Port"
+  throw "$Name did not become ready: ${loopbackHost}:$Port"
 }
 
 function Stop-CodexProcesses {
@@ -447,7 +449,7 @@ function Test-DesktopConfigInstalled {
       $text.Contains($providerBegin) -and
       $text.Contains('model_provider = "hash-context"') -and
       $text.Contains('features.hooks = true') -and
-      ($text.Contains("http://localhost:$proxyPort/v1") -or $text.Contains("http://127.0.0.1:$proxyPort/v1"))
+      ($text.Contains("http://${loopbackHost}:$proxyPort/v1") -or $text.Contains("http://localhost:$proxyPort/v1") -or $text.Contains("http://127.0.0.1:$proxyPort/v1"))
     )
   } catch {
     return $false
@@ -461,18 +463,22 @@ function Start-DesktopServices {
     Stop-ProjectServicePorts -Reason "refresh source proxy"
   }
 
-  if ((Test-TcpPortOpen -Port ([int] $proxyPort)) -and
-      (Test-TcpPortOpen -Port 8765) -and
-      (Test-HttpOk "http://127.0.0.1:$controlPort/health")) {
+  if ((Test-HttpOk "http://${serviceProbeHost}:$proxyPort/api/proxy/health") -and
+      (Test-HttpOk "http://${serviceProbeHost}:8765/api/health") -and
+      (Test-HttpOk "http://${loopbackHost}:$controlPort/health")) {
     Write-Host "[hash-context] desktop services already running"
     return 0
   }
 
+  Stop-ProjectServicePorts -Reason "refresh incomplete desktop services"
+
   $previousStartHidden = $env:HASH_CONTEXT_START_HIDDEN
   $previousControlPort = $env:HASH_CONTEXT_CONTROL_PORT
+  $previousHost = $env:HASH_CONTEXT_HOST
   $previousPreferSource = $env:HASH_CONTEXT_PREFER_SOURCE_SERVERS
   $env:HASH_CONTEXT_START_HIDDEN = "1"
   $env:HASH_CONTEXT_CONTROL_PORT = $controlPort
+  $env:HASH_CONTEXT_HOST = $loopbackHost
   if ($null -eq $previousPreferSource -and $env:HASH_CONTEXT_USE_BUNDLED_PYTHON -ne "1") {
     $env:HASH_CONTEXT_PREFER_SOURCE_SERVERS = "1"
   }
@@ -487,15 +493,20 @@ function Start-DesktopServices {
   } else {
     $env:HASH_CONTEXT_CONTROL_PORT = $previousControlPort
   }
+  if ($null -eq $previousHost) {
+    Remove-Item Env:\HASH_CONTEXT_HOST -ErrorAction SilentlyContinue
+  } else {
+    $env:HASH_CONTEXT_HOST = $previousHost
+  }
   if ($null -eq $previousPreferSource) {
     Remove-Item Env:\HASH_CONTEXT_PREFER_SOURCE_SERVERS -ErrorAction SilentlyContinue
   } else {
     $env:HASH_CONTEXT_PREFER_SOURCE_SERVERS = $previousPreferSource
   }
 
-  Wait-TcpPortOpen -Name "proxy" -Port ([int] $proxyPort)
-  Wait-TcpPortOpen -Name "backend" -Port 8765
-  Wait-HttpOk -Name "window-control" -Url "http://127.0.0.1:$controlPort/health"
+  Wait-HttpOk -Name "proxy" -Url "http://${serviceProbeHost}:$proxyPort/api/proxy/health" -TimeoutSeconds 30
+  Wait-HttpOk -Name "backend" -Url "http://${serviceProbeHost}:8765/api/health" -TimeoutSeconds 30
+  Wait-HttpOk -Name "window-control" -Url "http://${loopbackHost}:$controlPort/health" -TimeoutSeconds 90
   return $process.Id
 }
 
@@ -550,9 +561,9 @@ function Show-DesktopStatus {
       Write-Host "[hash-context] config warning: features.codex_hooks is deprecated; use features.hooks" -ForegroundColor DarkYellow
     }
   }
-  Write-Host "[hash-context] services proxy: $(if (Test-TcpPortOpen -Port ([int] $proxyPort)) { 'ready' } else { 'not ready' })"
-  Write-Host "[hash-context] services backend: $(if (Test-TcpPortOpen -Port 8765) { 'ready' } else { 'not ready' })"
-  Write-Host "[hash-context] services control: $(if (Test-HttpOk "http://127.0.0.1:$controlPort/health") { 'ready' } else { 'not ready' })"
+  Write-Host "[hash-context] services proxy: $(if (Test-HttpOk "http://${serviceProbeHost}:$proxyPort/api/proxy/health") { 'ready' } else { 'not ready' })"
+  Write-Host "[hash-context] services backend: $(if (Test-HttpOk "http://${serviceProbeHost}:8765/api/health") { 'ready' } else { 'not ready' })"
+  Write-Host "[hash-context] services control: $(if (Test-HttpOk "http://${loopbackHost}:$controlPort/health") { 'ready' } else { 'not ready' })"
   Write-Host "[hash-context] data dir: $($snapshot.data_dir)"
   Write-Host "[hash-context] sessions before/current: $beforeSessions/$($snapshot.session_count)"
   Write-Host "[hash-context] proxy log bytes before/current: $beforeLog/$($snapshot.proxy_log_length)"

@@ -11,6 +11,8 @@ $controlPort = $env:HASH_CONTEXT_CONTROL_PORT
 if (-not $controlPort) {
   $controlPort = "8790"
 }
+$loopbackHost = if ($env:HASH_CONTEXT_HOST) { $env:HASH_CONTEXT_HOST } else { "localhost" }
+$serviceProbeHost = if ($loopbackHost -eq "localhost") { "127.0.0.1" } else { $loopbackHost }
 
 function Stop-ProjectProcessOnPort {
   param(
@@ -72,7 +74,7 @@ $hookConfig = "hooks.UserPromptSubmit=[{matcher='*',hooks=[{type='command',comma
 
 $configArgs = @(
   "-c", "model_providers.hash-context.name=Hash Context",
-  "-c", "model_providers.hash-context.base_url=http://127.0.0.1:$proxyPort/v1",
+  "-c", "model_providers.hash-context.base_url=http://${loopbackHost}:$proxyPort/v1",
   "-c", "model_providers.hash-context.requires_openai_auth=true",
   "-c", "model_providers.hash-context.wire_api=responses",
   "-c", "model_providers.hash-context.supports_websockets=false",
@@ -106,7 +108,7 @@ function Test-TcpPortOpen {
   param([int] $Port)
   $client = [System.Net.Sockets.TcpClient]::new()
   try {
-    $async = $client.BeginConnect("127.0.0.1", $Port, $null, $null)
+    $async = $client.BeginConnect("$loopbackHost", $Port, $null, $null)
     if (-not $async.AsyncWaitHandle.WaitOne(500)) {
       return $false
     }
@@ -145,12 +147,12 @@ function Wait-TcpPortOpen {
   $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
   while ((Get-Date) -lt $deadline) {
     if (Test-TcpPortOpen -Port $Port) {
-      Write-Host "[ok] $Name -> 127.0.0.1:$Port" -ForegroundColor Green
+      Write-Host "[ok] $Name -> ${loopbackHost}:$Port" -ForegroundColor Green
       return
     }
     Start-Sleep -Milliseconds 500
   }
-  throw "$Name did not become ready: 127.0.0.1:$Port"
+  throw "$Name did not become ready: ${loopbackHost}:$Port"
 }
 
 function ConvertTo-FullPath {
@@ -219,7 +221,7 @@ if (-not $codexCommand) {
   throw "codex command was not found in PATH. Please confirm that running 'codex' directly works in this terminal."
 }
 
-$localNoProxy = "127.0.0.1,localhost,::1"
+$localNoProxy = "$loopbackHost,localhost,127.0.0.1,::1"
 $env:NO_PROXY = if ($env:NO_PROXY) { "$localNoProxy,$env:NO_PROXY" } else { $localNoProxy }
 $env:no_proxy = if ($env:no_proxy) { "$localNoProxy,$env:no_proxy" } else { $localNoProxy }
 
@@ -247,17 +249,17 @@ if ($null -eq $previousControlPort) {
 }
 Write-Host "[hash-context] launcher pid: $($windowProcess.Id)"
 
-Wait-TcpPortOpen -Name "proxy" -Port ([int] $proxyPort)
-Wait-TcpPortOpen -Name "backend" -Port 8765
+Wait-HttpOk -Name "proxy" -Url "http://${serviceProbeHost}:$proxyPort/api/proxy/health" -TimeoutSeconds 30
+Wait-HttpOk -Name "backend" -Url "http://${serviceProbeHost}:8765/api/health" -TimeoutSeconds 30
 if ($usesPackagedWindow) {
-  Wait-HttpOk -Name "frontend" -Url "http://127.0.0.1:8765/react/"
+  Wait-HttpOk -Name "frontend" -Url "http://${loopbackHost}:8765/react/"
 } else {
-  Wait-HttpOk -Name "frontend" -Url "http://127.0.0.1:5174/"
+  Wait-HttpOk -Name "frontend" -Url "http://${loopbackHost}:5174/"
 }
-Wait-HttpOk -Name "window-control" -Url "http://127.0.0.1:$controlPort/health"
+Wait-HttpOk -Name "window-control" -Url "http://${loopbackHost}:$controlPort/health" -TimeoutSeconds 90
 
 Write-Host "[hash-context] starting Codex through local proxy..." -ForegroundColor Cyan
-Write-Host "[hash-context] base_url=http://127.0.0.1:$proxyPort/v1"
+Write-Host "[hash-context] base_url=http://${loopbackHost}:$proxyPort/v1"
 Write-Host "[hash-context] type context or ctx inside Codex to open the workbench"
 Write-Host "[hash-context] if Codex says hooks need review, run /hooks and approve HashContext once"
 Write-Host "[hash-context] logs: $($root.Path)\logs\electron-window.log"

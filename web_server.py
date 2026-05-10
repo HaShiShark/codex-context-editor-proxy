@@ -166,7 +166,7 @@ class SessionState:
     title: str
     scope: str
     project_id: str | None
-    agent: SimpleAgent
+    agent: SimpleAgent | None
     transcript: list[dict[str, object]]
     context_workbench_history: list[dict[str, str]]
     context_revisions: list[dict[str, object]]
@@ -174,6 +174,7 @@ class SessionState:
     active_request_mode: str | None = None
     active_request_id: str | None = None
     active_cancel_event: threading.Event | None = None
+    agent_hydrated: bool = True
 
 
 @dataclass(slots=True)
@@ -457,7 +458,9 @@ class AppState:
     def reset_session(self, session_id: str) -> SessionState:
         session = self.get_session(session_id)
         with self.lock:
-            session.agent.reset()
+            if session.agent is not None:
+                session.agent.reset()
+            session.agent_hydrated = True
             session.title = NEW_SESSION_TITLE
             session.transcript = []
             session.context_workbench_history = []
@@ -946,19 +949,20 @@ class AppState:
                     continue
                 scope = self._normalize_scope(item.get("scope"))
                 project_id = sanitize_text(item.get("project_id") or "").strip() or None
-                transcript = normalize_transcript(item.get("transcript"))
+                raw_transcript = item.get("transcript")
+                transcript = raw_transcript if isinstance(raw_transcript, list) else []
                 session = SessionState(
                     session_id=safe_session_id,
                     title=sanitize_text(item.get("title") or NEW_SESSION_TITLE).strip() or NEW_SESSION_TITLE,
                     scope=scope,
                     project_id=project_id if scope == "project" else None,
-                    agent=SimpleAgent(self._settings_for_project_locked(project_id if scope == "project" else None)),
+                    agent=None,
                     transcript=transcript,
                     context_workbench_history=normalize_context_chat_history(item.get("context_workbench_history")),
-                    context_revisions=normalize_context_revision_entries(item.get("context_revisions")),
-                    pending_context_restore=normalize_pending_context_restore(item.get("pending_context_restore")),
+                    context_revisions=item.get("context_revisions") if isinstance(item.get("context_revisions"), list) else [],
+                    pending_context_restore=item.get("pending_context_restore") if isinstance(item.get("pending_context_restore"), dict) else None,
+                    agent_hydrated=False,
                 )
-                self._hydrate_agent_locked(session)
                 self.sessions[safe_session_id] = session
 
         raw_chat_session_ids = raw_state.get("chat_session_ids", [])
@@ -971,7 +975,6 @@ class AppState:
 
         with self.lock:
             self._repair_state_locked()
-            self._save_state_locked()
 
     def _repair_state_locked(self) -> None:
         default_project = self._ensure_default_project_locked()
@@ -1217,9 +1220,16 @@ class AppState:
     def _normalize_scope(self, raw_scope: Any) -> str:
         return "project" if sanitize_text(raw_scope or "").strip() == "project" else "chat"
 
+    def _agent_locked(self, session: SessionState) -> SimpleAgent:
+        if session.agent is None:
+            session.agent = SimpleAgent(self._settings_for_session_locked(session))
+            session.agent_hydrated = False
+        return session.agent
+
     def _hydrate_agent_locked(self, session: SessionState) -> None:
-        session.agent.reset()
-        session.agent.history = []
+        agent = self._agent_locked(session)
+        agent.reset()
+        agent.history = []
         normalized_transcript = normalize_transcript(session.transcript)
         session.transcript = normalized_transcript
         for record_index, record in enumerate(normalized_transcript):
@@ -1235,7 +1245,14 @@ class AppState:
                 blocks=normalize_message_blocks(record.get("blocks")),
                 record_index=record_index,
             )
-            session.agent.history.extend(provider_items)
+            agent.history.extend(provider_items)
+        session.agent_hydrated = True
+
+    def ensure_agent_hydrated(self, session: SessionState) -> SimpleAgent:
+        with self.lock:
+            if not session.agent_hydrated:
+                self._hydrate_agent_locked(session)
+            return self._agent_locked(session)
 
 
 def summarize_title(message: str) -> str:
@@ -7164,6 +7181,10 @@ class HashHTTPRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/health":
+            self._send_json({"ok": True})
+            return
+
         if parsed.path == "/api/init":
             self._send_json(self.app_state.bootstrap_payload())
             return
@@ -7703,6 +7724,7 @@ class HashHTTPRequestHandler(BaseHTTPRequestHandler):
                 )
                 request_id = self.app_state.acquire_session_request(session, "context")
                 try:
+                    self.app_state.ensure_agent_hydrated(session)
                     answer, used_model, draft, tool_events = run_context_chat_turn(
                         session,
                         message=message,
@@ -7768,6 +7790,7 @@ class HashHTTPRequestHandler(BaseHTTPRequestHandler):
                     self._write_stream_event({"type": "reset"})
 
                 try:
+                    self.app_state.ensure_agent_hydrated(session)
                     answer, used_model, draft, tool_events = run_context_chat_turn(
                         session,
                         message=message,
@@ -8094,7 +8117,8 @@ class HashHTTPRequestHandler(BaseHTTPRequestHandler):
                     self._write_stream_event({"type": "reset"})
 
                 try:
-                    answer, tool_events = session.agent.run_turn(
+                    agent = self.app_state.ensure_agent_hydrated(session)
+                    answer, tool_events = agent.run_turn(
                         message,
                         attachments=agent_attachments,
                         model=model,
@@ -8180,7 +8204,8 @@ class HashHTTPRequestHandler(BaseHTTPRequestHandler):
                         model=model,
                     )
                 try:
-                    answer, tool_events = session.agent.run_turn(
+                    agent = self.app_state.ensure_agent_hydrated(session)
+                    answer, tool_events = agent.run_turn(
                         message,
                         attachments=agent_attachments,
                         model=model,
@@ -8342,7 +8367,7 @@ def main() -> None:
     load_dotenv(REPO_ROOT / ".env")
     settings = load_settings()
     port = int(os.getenv("HASH_WEB_PORT", "8765"))
-    host = os.getenv("HASH_WEB_HOST", "127.0.0.1")
+    host = os.getenv("HASH_WEB_HOST", os.getenv("HASH_CONTEXT_HOST", "localhost"))
     app_state = AppState(settings)
     server = HashHTTPServer((host, port), app_state)
 

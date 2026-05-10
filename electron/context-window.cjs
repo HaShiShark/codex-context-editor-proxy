@@ -4,7 +4,8 @@ const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
 
-const HOST = '127.0.0.1';
+const HOST = process.env.HASH_CONTEXT_HOST || 'localhost';
+const PROBE_HOST = process.env.HASH_CONTEXT_PROBE_HOST || (HOST === 'localhost' ? '127.0.0.1' : HOST);
 const BACKEND_PORT = 8765;
 const FRONTEND_PORT = 5174;
 const PROXY_PORT = 8787;
@@ -36,11 +37,11 @@ function writeLog(message) {
   );
 }
 
-function requestOk(port, pathname = '/') {
+function requestOk(port, pathname = '/', hostname = HOST) {
   return new Promise((resolve) => {
     const req = http.get(
       {
-        hostname: HOST,
+        hostname,
         port,
         path: pathname,
         timeout: 1000,
@@ -140,25 +141,58 @@ function startControlServer() {
   });
 }
 
-async function waitFor(port, pathname, label, timeoutMs = 30000) {
+async function waitFor(port, pathname, label, timeoutMs = 30000, hostname = HOST) {
   const startedAt = Date.now();
 
   while (Date.now() - startedAt < timeoutMs) {
-    if (await requestOk(port, pathname)) {
+    if (await requestOk(port, pathname, hostname)) {
       return;
     }
     await new Promise((resolve) => setTimeout(resolve, 300));
   }
 
-  throw new Error(`${label} did not become ready on ${HOST}:${port}.`);
+  throw new Error(`${label} did not become ready on ${hostname}:${port}.`);
 }
 
-function pythonCommand(root) {
+function pythonCandidateWorks(candidate) {
+  const result = spawnSync(
+    candidate.command,
+    [...candidate.args, '-c', 'import dotenv, zstandard'],
+    { encoding: 'utf8', timeout: 5000, windowsHide: true },
+  );
+  return result.status === 0;
+}
+
+function sourcePythonCandidates(root) {
   const localPython = process.platform === 'win32'
     ? path.join(root, '.venv', 'Scripts', 'python.exe')
     : path.join(root, '.venv', 'bin', 'python');
-  const fallbackPython = process.platform === 'win32' ? 'python' : 'python3';
-  return fs.existsSync(localPython) ? localPython : fallbackPython;
+  const candidates = [];
+
+  if (process.env.HASH_CONTEXT_PYTHON) {
+    candidates.push({ command: process.env.HASH_CONTEXT_PYTHON, args: [] });
+  }
+  if (fs.existsSync(localPython)) {
+    candidates.push({ command: localPython, args: [] });
+  }
+  if (process.platform === 'win32') {
+    candidates.push({ command: 'py', args: ['-3'] });
+    candidates.push({ command: 'python', args: [] });
+  } else {
+    candidates.push({ command: 'python3', args: [] });
+    candidates.push({ command: 'python', args: [] });
+  }
+
+  return candidates;
+}
+
+function pythonScriptCommand(root, scriptName) {
+  for (const candidate of sourcePythonCandidates(root)) {
+    if (pythonCandidateWorks(candidate)) {
+      return { command: candidate.command, args: [...candidate.args, scriptName] };
+    }
+  }
+  throw new Error('No usable Python runtime found. Run npm run setup:python or set HASH_CONTEXT_PYTHON to a Python with the project dependencies installed.');
 }
 
 function pythonServerCommand(root, scriptName, exeName) {
@@ -166,7 +200,7 @@ function pythonServerCommand(root, scriptName, exeName) {
     process.env.HASH_CONTEXT_PREFER_SOURCE_SERVERS === '1' ||
     (!app.isPackaged && process.env.HASH_CONTEXT_USE_BUNDLED_PYTHON !== '1');
   if (preferSource) {
-    return { command: pythonCommand(root), args: [scriptName] };
+    return pythonScriptCommand(root, scriptName);
   }
 
   const candidates = process.platform === 'win32'
@@ -185,7 +219,7 @@ function pythonServerCommand(root, scriptName, exeName) {
     }
   }
 
-  return { command: pythonCommand(root), args: [scriptName] };
+  return pythonScriptCommand(root, scriptName);
 }
 
 function cleanEnv(extra = {}) {
@@ -200,7 +234,7 @@ function cleanEnv(extra = {}) {
 
 async function startBackend(root) {
   writeLog('checking backend');
-  if (await requestOk(BACKEND_PORT, '/api/init')) {
+  if (await requestOk(BACKEND_PORT, '/api/health', PROBE_HOST)) {
     writeLog('backend already running');
     return;
   }
@@ -228,13 +262,13 @@ async function startBackend(root) {
     writeLog(`[backend:error] ${chunk.toString().trim()}`);
   });
 
-  await waitFor(BACKEND_PORT, '/api/init', 'Backend');
+  await waitFor(BACKEND_PORT, '/api/health', 'Backend', 30000, PROBE_HOST);
   writeLog('backend ready');
 }
 
 async function startProxy(root) {
   writeLog('checking proxy');
-  if (await requestOk(PROXY_PORT, '/api/proxy/sessions')) {
+  if (await requestOk(PROXY_PORT, '/api/proxy/health', PROBE_HOST)) {
     writeLog('proxy already running');
     return;
   }
@@ -262,7 +296,7 @@ async function startProxy(root) {
     writeLog(`[proxy:error] ${chunk.toString().trim()}`);
   });
 
-  await waitFor(PROXY_PORT, '/api/proxy/sessions', 'Proxy');
+  await waitFor(PROXY_PORT, '/api/proxy/health', 'Proxy', 30000, PROBE_HOST);
   writeLog('proxy ready');
 }
 

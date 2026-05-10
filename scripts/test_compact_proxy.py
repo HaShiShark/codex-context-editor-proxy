@@ -490,6 +490,56 @@ def test_local_compact_without_override_preserves_codex_body() -> None:
         assert request_log[-1]["forwarded_body"] == original_body
 
 
+def test_tool_output_request_with_override_does_not_restore_raw_context() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        store = proxy_server.ProxyStore(Path(temp_dir) / "proxy_state.json")
+        store.sessions[SESSION_ID] = proxy_server.ProxySession(
+            id=SESSION_ID,
+            title="Codex fake",
+            transcript=[record("user", CODEX_ORIGINAL_TEXT)],
+            edited_transcript=[record("user", EDITED_TEXT)],
+            status="override",
+        )
+        tool_body = {
+            "input": [
+                proxy_server.provider_message("user", CODEX_ORIGINAL_TEXT),
+                proxy_server.provider_message("user", USER_PROMPT),
+                {
+                    "type": "function_call",
+                    "call_id": TOOL_CALL_ID,
+                    "name": "shell_command",
+                    "arguments": json.dumps({"command": "Get-ChildItem -Force"}),
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": TOOL_CALL_ID,
+                    "output": "README.md\nproxy_server.py",
+                },
+            ],
+            "previous_response_id": "resp_from_raw_context",
+        }
+
+        store.begin_request(SESSION_ID, tool_body, {"x-codex-session-id": SESSION_ID})
+        session = store.sessions[SESSION_ID]
+        forwarded_text = json.dumps(session.request_log[-1]["forwarded_body"], ensure_ascii=False)
+        pending_texts = provider_texts(session.pending_transcript or [])
+
+        assert session.request_log[-1]["kind"] == "override_tool_output_rewrite"
+        assert EDITED_TEXT in forwarded_text
+        assert CODEX_ORIGINAL_TEXT not in forwarded_text
+        assert "previous_response_id" not in session.request_log[-1]["forwarded_body"]
+        assert EDITED_TEXT in pending_texts
+        assert CODEX_ORIGINAL_TEXT not in pending_texts
+
+        store.complete_response(SESSION_ID, [{"type": "message", "role": "assistant", "content": []}], FINAL_TEXT)
+        payload = store.get_session(SESSION_ID)
+        assert payload is not None
+        edited_texts = provider_texts(payload["edited_transcript"] or [])
+        assert EDITED_TEXT in edited_texts
+        assert CODEX_ORIGINAL_TEXT not in edited_texts
+        assert FINAL_TEXT in edited_texts[-1]
+
+
 def test_tool_turn_stays_single_assistant_record() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         store = proxy_server.ProxyStore(Path(temp_dir) / "proxy_state.json")
@@ -1166,7 +1216,12 @@ def test_override_tool_output_requests_are_passed_through() -> None:
 
         _session, forwarded = store.begin_request(SESSION_ID, body, {"x-codex-session-id": SESSION_ID})
 
-        assert forwarded == body
+        forwarded_text = json.dumps(forwarded, ensure_ascii=False)
+        assert forwarded != body
+        assert "edited context" in forwarded_text
+        assert "run the date" in forwarded_text
+        assert "2026-05-05 23:23:59 +08:00" in forwarded_text
+        assert "previous_response_id" not in forwarded
         store.complete_response(
             SESSION_ID,
             [proxy_server.provider_message("assistant", "done")],
@@ -1186,7 +1241,7 @@ def test_override_tool_output_requests_are_passed_through() -> None:
         assert tool_event["display_detail"] == "Get-Date"
         stored = json.loads((Path(temp_dir) / "proxy_state.json").read_text(encoding="utf-8"))
         session = next(item for item in stored["sessions"] if item["id"] == SESSION_ID)
-        assert session["request_log"][-1]["kind"] == "tool_output_passthrough"
+        assert session["request_log"][-1]["kind"] == "override_tool_output_rewrite"
 
 
 def test_proxy_override_deleted_tools_are_not_reintroduced_by_next_request() -> None:

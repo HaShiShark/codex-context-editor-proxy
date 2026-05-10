@@ -8,6 +8,9 @@ try {
 } catch {
 }
 
+$loopbackHost = if ($env:HASH_CONTEXT_HOST) { $env:HASH_CONTEXT_HOST } else { "localhost" }
+$serviceProbeHost = if ($loopbackHost -eq "localhost") { "127.0.0.1" } else { $loopbackHost }
+
 function Write-HookJson {
   param(
     [hashtable] $Payload
@@ -134,7 +137,7 @@ function Sync-LocalCodexSession {
 
   try {
     $payload = @{ session_id = $SessionId; title = "Codex $($SessionId.Substring(0, 8))" } | ConvertTo-Json -Compress
-    Invoke-WebRequest -Uri "http://127.0.0.1:8765/api/codex-local-session-sync" -Method Post -Body $payload -ContentType "application/json" -UseBasicParsing -TimeoutSec 8 | Out-Null
+    Invoke-WebRequest -Uri "http://${serviceProbeHost}:8765/api/codex-local-session-sync" -Method Post -Body $payload -ContentType "application/json" -UseBasicParsing -TimeoutSec 8 | Out-Null
     Write-HookLog "local-session-sync ok session_id=$SessionId"
   } catch {
     Write-HookLog "local-session-sync failed session_id=$SessionId error=$($_.Exception.Message)"
@@ -169,7 +172,7 @@ function Write-BackgroundLog {
 `$sessionId = '$escapedSessionId'
 try {
   `$payload = @{ session_id = `$sessionId; title = "Codex `$(`$sessionId.Substring(0, 8))" } | ConvertTo-Json -Compress
-  Invoke-WebRequest -Uri "http://127.0.0.1:8765/api/codex-local-session-sync" -Method Post -Body `$payload -ContentType "application/json" -UseBasicParsing -TimeoutSec 20 | Out-Null
+  Invoke-WebRequest -Uri "http://${serviceProbeHost}:8765/api/codex-local-session-sync" -Method Post -Body `$payload -ContentType "application/json" -UseBasicParsing -TimeoutSec 20 | Out-Null
   Write-BackgroundLog "local-session-sync ok session_id=`$sessionId"
 } catch {
   Write-BackgroundLog "local-session-sync failed session_id=`$sessionId error=`$(`$_.Exception.Message)"
@@ -194,7 +197,7 @@ function Consume-ContextEditMarker {
 
   try {
     $payload = @{ session_id = $SessionId } | ConvertTo-Json -Compress
-    $response = Invoke-WebRequest -Uri "http://127.0.0.1:8765/api/context-edit-marker-consume" -Method Post -Body $payload -ContentType "application/json; charset=utf-8" -UseBasicParsing -TimeoutSec 2
+    $response = Invoke-WebRequest -Uri "http://${serviceProbeHost}:8765/api/context-edit-marker-consume" -Method Post -Body $payload -ContentType "application/json; charset=utf-8" -UseBasicParsing -TimeoutSec 2
     $body = $response.Content | ConvertFrom-Json
     if ($body -and $body.marker) {
       Write-HookLog "context-edit-marker consumed session_id=$SessionId marker=$($response.Content)"
@@ -262,7 +265,7 @@ try {
   if (-not $sessionId) {
     $sessionId = Find-LatestHistorySessionId -Prompt $prompt
   }
-  $showUrl = "http://127.0.0.1:$controlPort/show"
+  $showUrl = "http://${loopbackHost}:$controlPort/show"
   if ($sessionId) {
     $showUrl = "$showUrl`?session_id=$([uri]::EscapeDataString($sessionId))"
   }

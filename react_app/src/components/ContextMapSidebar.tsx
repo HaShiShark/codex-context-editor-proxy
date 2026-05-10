@@ -172,11 +172,12 @@ function areScrollMetricsEqual(left: ScrollMetrics, right: ScrollMetrics) {
 function canExpandMessage(record: MessageRecord, previewText: string, isPreviewTruncated: boolean) {
   void previewText;
   const textValue = record.text || '';
+  const trimmedTextValue = textValue.trim();
   const hasStructuredContent = Boolean(
     record.attachments.length
     || record.toolEvents.length
     || record.blocks.length > 1
-    || /\r?\n/.test(textValue),
+    || /\r?\n/.test(trimmedTextValue),
   );
 
   return hasStructuredContent || isPreviewTruncated;

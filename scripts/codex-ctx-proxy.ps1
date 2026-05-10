@@ -13,6 +13,8 @@ $defaultHome = Join-Path $env:USERPROFILE ".hash-context-codex"
 $shimDir = if ($env:HASH_CONTEXT_SHIM_DIR) { $env:HASH_CONTEXT_SHIM_DIR } else { Join-Path $defaultHome "bin" }
 $statePath = if ($env:HASH_CONTEXT_PROXY_SWITCH_STATE) { $env:HASH_CONTEXT_PROXY_SWITCH_STATE } else { Join-Path $defaultHome "codex-ctx-proxy.json" }
 $skipPathUpdate = ($env:HASH_CONTEXT_SKIP_PATH_UPDATE -eq "1")
+$proxyPort = if ($env:HASH_CONTEXT_PROXY_PORT) { $env:HASH_CONTEXT_PROXY_PORT } else { "8787" }
+$loopbackHost = if ($env:HASH_CONTEXT_HOST) { $env:HASH_CONTEXT_HOST } else { "localhost" }
 
 function ConvertTo-FullPath {
   param([string] $Path)
@@ -284,21 +286,91 @@ function Invoke-RealCodex {
   exit $LASTEXITCODE
 }
 
+function Test-DesktopHookConfigInstalled {
+  $desktopConfigPath = if ($env:HASH_CONTEXT_DESKTOP_CONFIG) { $env:HASH_CONTEXT_DESKTOP_CONFIG } else { Join-Path $env:USERPROFILE ".codex\config.toml" }
+  if (-not (Test-Path $desktopConfigPath)) {
+    return $false
+  }
+
+  try {
+    $configText = Get-Content -Raw -Path $desktopConfigPath
+    return (
+      $configText.Contains("# BEGIN HASH_CONTEXT_DESKTOP_TOP") -and
+      $configText.Contains("hooks.UserPromptSubmit") -and
+      $configText.Contains("codex-context-hook.cmd")
+    )
+  } catch {
+    return $false
+  }
+}
+
+function Get-HashContextCodexArgs {
+  $hookCommand = (Join-Path $projectRoot.Path "scripts\codex-context-hook.cmd").Replace("\", "/")
+  $hookConfig = "hooks.UserPromptSubmit=[{matcher='*',hooks=[{type='command',command='$hookCommand',timeout=10,statusMessage='HashContext'}]}]"
+
+  $configArgs = @(
+    "-c", "model_providers.hash-context.name=Hash Context",
+    "-c", "model_providers.hash-context.base_url=http://${loopbackHost}:$proxyPort/v1",
+    "-c", "model_providers.hash-context.requires_openai_auth=true",
+    "-c", "model_providers.hash-context.wire_api=responses",
+    "-c", "model_providers.hash-context.supports_websockets=false",
+    "-c", "model_provider=hash-context"
+  )
+
+  if (-not (Test-DesktopHookConfigInstalled)) {
+    $configArgs += @(
+      "-c", "features.hooks=true",
+      "-c", $hookConfig
+    )
+  }
+
+  $autoCompactTokenLimit = $env:HASH_CONTEXT_AUTO_COMPACT_TOKEN_LIMIT
+  if ($autoCompactTokenLimit) {
+    $autoCompactTokenLimit = $autoCompactTokenLimit.Trim()
+    if ($autoCompactTokenLimit -notmatch '^\d+$') {
+      throw "HASH_CONTEXT_AUTO_COMPACT_TOKEN_LIMIT must be an integer token count."
+    }
+    $configArgs += @("-c", "model_auto_compact_token_limit=$autoCompactTokenLimit")
+  }
+
+  return $configArgs
+}
+
+function Invoke-DesktopProxyCommand {
+  param([string] $DesktopCommand)
+
+  $desktopScript = Join-Path $projectRoot.Path "scripts\codex-desktop-proxy.ps1"
+  & powershell -NoProfile -ExecutionPolicy Bypass -File $desktopScript $DesktopCommand 2>&1 | ForEach-Object {
+    Write-Host $_
+  }
+  return [int] $LASTEXITCODE
+}
+
 function Invoke-HashContextCodex {
   param([string[]] $ForwardArgs)
   $state = Read-SwitchState
   $preferred = if ($state -and $state.real_codex) { [string] $state.real_codex } else { "" }
   $realCodex = Find-RealCodex -Preferred $preferred
-  $previousRealCodex = $env:HASH_CONTEXT_REAL_CODEX
-  $env:HASH_CONTEXT_REAL_CODEX = $realCodex
+  $configArgs = Get-HashContextCodexArgs
+
+  $localNoProxy = "$loopbackHost,localhost,127.0.0.1,::1"
+  $previousNoProxy = $env:NO_PROXY
+  $previousLowerNoProxy = $env:no_proxy
+  $env:NO_PROXY = if ($env:NO_PROXY) { "$localNoProxy,$env:NO_PROXY" } else { $localNoProxy }
+  $env:no_proxy = if ($env:no_proxy) { "$localNoProxy,$env:no_proxy" } else { $localNoProxy }
   try {
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $projectRoot.Path "scripts\codex-with-context.ps1") @ForwardArgs
+    & $realCodex @configArgs @ForwardArgs
     exit $LASTEXITCODE
   } finally {
-    if ($null -eq $previousRealCodex) {
-      Remove-Item Env:\HASH_CONTEXT_REAL_CODEX -ErrorAction SilentlyContinue
+    if ($null -eq $previousNoProxy) {
+      Remove-Item Env:\NO_PROXY -ErrorAction SilentlyContinue
     } else {
-      $env:HASH_CONTEXT_REAL_CODEX = $previousRealCodex
+      $env:NO_PROXY = $previousNoProxy
+    }
+    if ($null -eq $previousLowerNoProxy) {
+      Remove-Item Env:\no_proxy -ErrorAction SilentlyContinue
+    } else {
+      $env:no_proxy = $previousLowerNoProxy
     }
   }
 }
@@ -310,13 +382,23 @@ function Invoke-Dispatch {
     switch ($ForwardArgs[2]) {
       "on" {
         $realCodex = Ensure-Installed -Enabled $true
+        $desktopExitCode = Invoke-DesktopProxyCommand -DesktopCommand "on"
+        if ($desktopExitCode -ne 0) {
+          exit $desktopExitCode
+        }
         Write-Host "[hash-context] codex ctx proxy on"
+        Write-Host "[hash-context] persistent proxy services are running"
         Write-Host "[hash-context] real codex: $realCodex"
         exit 0
       }
       "off" {
         $realCodex = Ensure-Installed -Enabled $false
+        $desktopExitCode = Invoke-DesktopProxyCommand -DesktopCommand "off"
+        if ($desktopExitCode -ne 0) {
+          exit $desktopExitCode
+        }
         Write-Host "[hash-context] codex ctx proxy off"
+        Write-Host "[hash-context] persistent proxy services are stopped"
         Write-Host "[hash-context] codex now passes through to: $realCodex"
         exit 0
       }
@@ -325,6 +407,7 @@ function Invoke-Dispatch {
         exit 0
       }
       "uninstall" {
+        Invoke-DesktopProxyCommand -DesktopCommand "off" | Out-Null
         Remove-Item -Path $shimDir -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item -Path $statePath -Force -ErrorAction SilentlyContinue
         Remove-ShimDirFromPath
@@ -367,14 +450,24 @@ switch ($Command) {
   }
   "on" {
     $realCodex = Ensure-Installed -Enabled $true
+    $desktopExitCode = Invoke-DesktopProxyCommand -DesktopCommand "on"
+    if ($desktopExitCode -ne 0) {
+      exit $desktopExitCode
+    }
     Write-Host "[hash-context] codex ctx proxy on"
+    Write-Host "[hash-context] persistent proxy services are running"
     Write-Host "[hash-context] real codex: $realCodex"
     Write-PathRefreshHint
     break
   }
   "off" {
     $realCodex = Ensure-Installed -Enabled $false
+    $desktopExitCode = Invoke-DesktopProxyCommand -DesktopCommand "off"
+    if ($desktopExitCode -ne 0) {
+      exit $desktopExitCode
+    }
     Write-Host "[hash-context] codex ctx proxy off"
+    Write-Host "[hash-context] persistent proxy services are stopped"
     Write-Host "[hash-context] codex now passes through to: $realCodex"
     break
   }
@@ -383,6 +476,7 @@ switch ($Command) {
     break
   }
   "uninstall" {
+    Invoke-DesktopProxyCommand -DesktopCommand "off" | Out-Null
     Remove-Item -Path $shimDir -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -Path $statePath -Force -ErrorAction SilentlyContinue
     Remove-ShimDirFromPath

@@ -25,7 +25,8 @@ from codex_context import (
 )
 
 
-HOST = os.environ.get("HASH_CONTEXT_PROXY_HOST", "127.0.0.1")
+
+HOST = os.environ.get("HASH_CONTEXT_PROXY_HOST", os.environ.get("HASH_CONTEXT_HOST", "localhost"))
 PORT = int(os.environ.get("HASH_CONTEXT_PROXY_PORT", "8787"))
 OPENAI_UPSTREAM_BASE_URL = os.environ.get(
     "HASH_CONTEXT_OPENAI_UPSTREAM_BASE_URL",
@@ -939,7 +940,7 @@ def open_context_workbench(session_id: str) -> tuple[bool, str]:
     path = "/show"
     if session_id:
         path = f"{path}?session_id={urllib.parse.quote(session_id, safe='')}"
-    conn = http.client.HTTPConnection("127.0.0.1", CONTROL_PORT, timeout=2)
+    conn = http.client.HTTPConnection(os.environ.get("HASH_CONTEXT_HOST", "localhost"), CONTROL_PORT, timeout=2)
     try:
         conn.request("POST", path, body=b"", headers={"Content-Length": "0"})
         response = conn.getresponse()
@@ -1317,14 +1318,17 @@ class ProxyStore:
                     merged_body_transcript,
                 )
                 if input_items_end_with_tool_output(body.get("input")):
-                    session.pending_transcript = with_running_assistant(source_transcript)
+                    session.edited_transcript = forwarded_transcript
+                    session.pending_transcript = with_running_assistant(forwarded_transcript)
+                    request_body["input"] = drop_unpaired_tool_items(transcript_to_input_items(forwarded_transcript))
+                    request_body.pop("previous_response_id", None)
                     session.status = "running"
                     session.last_error = ""
                     session.updated_at = utc_timestamp()
                     session.request_log.append(
                         {
                             "created_at": session.updated_at,
-                            "kind": "tool_output_passthrough",
+                            "kind": "override_tool_output_rewrite",
                             "headers": {key: value for key, value in headers.items() if key.lower().startswith("x-")},
                             "body": body,
                             "forwarded_body": request_body,
@@ -1728,6 +1732,17 @@ def latest_user_turn_tail(source_transcript: list[dict[str, Any]]) -> list[dict[
     return copy.deepcopy(source[start:])
 
 
+def latest_conversation_turn_tail(source_transcript: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    source = clean_transcript(source_transcript)
+    for index in range(len(source) - 1, -1, -1):
+        if str(source[index].get("role") or "") == "user" and not is_initial_context_prefix_record(source[index]):
+            start = index
+            while start > 0 and is_initial_context_prefix_record(source[start - 1]):
+                start -= 1
+            return copy.deepcopy(source[start:])
+    return []
+
+
 def merge_override_transcript(
     edited_transcript: list[dict[str, Any]],
     mirrored_transcript: list[dict[str, Any]],
@@ -1748,7 +1763,7 @@ def merge_override_transcript(
     if base and base_prefix >= len(base):
         return append_non_duplicate(base, source[base_prefix:])
 
-    latest_tail = latest_user_turn_tail(source)
+    latest_tail = latest_user_turn_tail(source) or latest_conversation_turn_tail(source)
     if latest_tail:
         return append_non_duplicate(base, latest_tail)
     return base
@@ -1785,6 +1800,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/proxy/health":
+            self._send_json({"ok": True})
+            return
+
         proxy_log(
             "incoming get "
             f"path={parsed.path} "
