@@ -34,7 +34,7 @@
     "build:python": "node scripts/build-python.mjs",
     "preview:react": "vite preview --config react_app/vite.config.ts",
     "pack:win": "npm run build:react && npm run build:python && electron-builder --win --dir",
-    "dist:win": "npm run build:react && npm run build:python && electron-builder --win nsis",
+    "dist:win": "npm run build:react && npm run build:python && electron-builder --win nsis --publish never",
     "pack:mac": "npm run build:react && npm run build:python && electron-builder --mac --dir",
     "dist:mac": "npm run build:react && npm run build:python && electron-builder --mac --publish never"
   },
