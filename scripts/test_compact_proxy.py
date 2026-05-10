@@ -459,7 +459,7 @@ def test_prefix_only_codex_local_session_is_not_conversation() -> None:
     assert not web_server.transcript_has_conversation_records(transcript)
 
 
-def test_local_compact_without_override_preserves_codex_body() -> None:
+def test_local_compact_without_override_replaces_manual_prompt() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         store = proxy_server.ProxyStore(Path(temp_dir) / "proxy_state.json")
         original_body = {
@@ -481,13 +481,252 @@ def test_local_compact_without_override_preserves_codex_body() -> None:
             {"x-codex-session-id": SESSION_ID},
         )
 
-        assert forwarded_body == original_body
+        assert forwarded_body["input"][:-1] == original_body["input"][:-1]
+        assert message_text(forwarded_body["input"][-1]) == proxy_server.MANUAL_LOCAL_COMPACT_PROMPT
+        assert forwarded_body["previous_response_id"] == original_body["previous_response_id"]
         session = store.get_session(SESSION_ID)
         assert session is not None
         assert session["status"] == "compacting"
         request_log = store.sessions[SESSION_ID].request_log
         assert request_log[-1]["kind"] == "local_compact"
-        assert request_log[-1]["forwarded_body"] == original_body
+        assert message_text(request_log[-1]["forwarded_body"]["input"][-1]) == proxy_server.MANUAL_LOCAL_COMPACT_PROMPT
+
+
+def test_replacement_compact_prompts_still_count_as_compact_prompts() -> None:
+    assert proxy_server.is_local_compact_prompt_text(proxy_server.MANUAL_LOCAL_COMPACT_PROMPT)
+    assert proxy_server.is_local_compact_prompt_text(proxy_server.AUTO_LOCAL_COMPACT_PROMPT)
+
+
+def test_clean_transcript_keeps_latest_local_compact_summary() -> None:
+    old_summary = f"{proxy_server.LOCAL_COMPACT_SUMMARY_PREFIX}\n\nold summary"
+    new_summary = f"{proxy_server.LOCAL_COMPACT_SUMMARY_PREFIX}\n\nnew summary"
+
+    cleaned = proxy_server.clean_transcript(
+        [
+            record("user", USER_PROMPT),
+            record("user", old_summary),
+            record("assistant", "work after old summary"),
+            record("user", new_summary),
+        ]
+    )
+
+    assert provider_texts(cleaned) == [USER_PROMPT, "work after old summary", new_summary]
+
+
+def test_local_auto_compact_replaces_prompt_with_concise_continuation_prompt() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        store = proxy_server.ProxyStore(Path(temp_dir) / "proxy_state.json")
+        original_body = {
+            "model": "gpt-test",
+            "input": [
+                proxy_server.provider_message("user", USER_PROMPT),
+                proxy_server.provider_message("assistant", PRE_TOOL_TEXT),
+                {
+                    "type": "function_call",
+                    "call_id": TOOL_CALL_ID,
+                    "name": "shell_command",
+                    "arguments": json.dumps({"command": "Get-ChildItem -Force"}),
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": TOOL_CALL_ID,
+                    "output": "README.md\nproxy_server.py",
+                },
+                proxy_server.provider_message("user", f"{proxy_server.LOCAL_COMPACT_PROMPT_PREFIX}\nSummarize."),
+            ],
+            "previous_response_id": "resp_from_codex",
+        }
+
+        _session, forwarded_body = store.begin_request(
+            SESSION_ID,
+            original_body,
+            {"x-codex-session-id": SESSION_ID},
+        )
+
+        assert message_text(forwarded_body["input"][-1]) == proxy_server.AUTO_LOCAL_COMPACT_PROMPT
+        assert proxy_server.MANUAL_LOCAL_COMPACT_PROMPT not in json.dumps(forwarded_body, ensure_ascii=False)
+        session = store.get_session(SESSION_ID)
+        assert session is not None
+        assert session["status"] == "compacting"
+        assert store.sessions[SESSION_ID].request_log[-1]["kind"] == "local_compact"
+
+
+def test_local_compact_prompt_replacement_preserves_input_item_shape() -> None:
+    prompt_item = {
+        "type": "message",
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": f"{proxy_server.LOCAL_COMPACT_PROMPT_PREFIX}\nSummarize."},
+        ],
+        "id": "prompt-message-id",
+    }
+    replaced = proxy_server.replace_last_local_compact_prompt_input(
+        [proxy_server.provider_message("user", USER_PROMPT), prompt_item],
+        proxy_server.MANUAL_LOCAL_COMPACT_PROMPT,
+    )
+
+    assert replaced[0] == proxy_server.provider_message("user", USER_PROMPT)
+    assert replaced[1]["id"] == "prompt-message-id"
+    assert replaced[1]["content"] == [
+        {"type": "input_text", "text": proxy_server.MANUAL_LOCAL_COMPACT_PROMPT}
+    ]
+
+
+def test_same_turn_local_compact_with_assistant_text_uses_auto_prompt() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        store = proxy_server.ProxyStore(Path(temp_dir) / "proxy_state.json")
+        turn_metadata = '{"turn_id":"turn-auto-text"}'
+        first_body = {
+            "input": [
+                proxy_server.provider_message("user", USER_PROMPT),
+            ],
+        }
+        store.begin_request(
+            SESSION_ID,
+            first_body,
+            {"x-codex-session-id": SESSION_ID, "x-codex-turn-metadata": turn_metadata},
+        )
+        compact_body = {
+            "input": [
+                proxy_server.provider_message("user", USER_PROMPT),
+                proxy_server.provider_message("assistant", "partial assistant text before auto compact"),
+                proxy_server.provider_message("user", f"{proxy_server.LOCAL_COMPACT_PROMPT_PREFIX}\nSummarize."),
+            ],
+            "previous_response_id": "resp_same_turn",
+        }
+
+        _session, forwarded_body = store.begin_request(
+            SESSION_ID,
+            compact_body,
+            {"x-codex-session-id": SESSION_ID, "x-codex-turn-metadata": turn_metadata},
+        )
+
+        assert message_text(forwarded_body["input"][-1]) == proxy_server.AUTO_LOCAL_COMPACT_PROMPT
+
+
+def test_new_turn_local_compact_with_assistant_text_uses_manual_prompt() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        store = proxy_server.ProxyStore(Path(temp_dir) / "proxy_state.json")
+        store.sessions[SESSION_ID] = proxy_server.ProxySession(
+            id=SESSION_ID,
+            title="Codex fake",
+            transcript=[record("user", USER_PROMPT), record("assistant", FINAL_TEXT)],
+            last_turn_metadata_header='{"turn_id":"previous-turn"}',
+            status="mirror",
+        )
+        body = {
+            "input": [
+                proxy_server.provider_message("user", USER_PROMPT),
+                proxy_server.provider_message("assistant", FINAL_TEXT),
+                proxy_server.provider_message("user", f"{proxy_server.LOCAL_COMPACT_PROMPT_PREFIX}\nSummarize."),
+            ],
+            "previous_response_id": "resp_previous_turn",
+        }
+
+        _session, forwarded_body = store.begin_request(
+            SESSION_ID,
+            body,
+            {"x-codex-session-id": SESSION_ID, "x-codex-turn-metadata": '{"turn_id":"manual-compact-turn"}'},
+        )
+
+        assert message_text(forwarded_body["input"][-1]) == proxy_server.MANUAL_LOCAL_COMPACT_PROMPT
+
+
+def test_running_status_alone_does_not_force_auto_compact_prompt() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        store = proxy_server.ProxyStore(Path(temp_dir) / "proxy_state.json")
+        store.sessions[SESSION_ID] = proxy_server.ProxySession(
+            id=SESSION_ID,
+            title="Codex fake",
+            transcript=[record("user", USER_PROMPT)],
+            status="running",
+        )
+        body = {
+            "input": [
+                proxy_server.provider_message("user", USER_PROMPT),
+                proxy_server.provider_message("assistant", FINAL_TEXT),
+                proxy_server.provider_message("user", f"{proxy_server.LOCAL_COMPACT_PROMPT_PREFIX}\nSummarize."),
+            ],
+            "previous_response_id": "resp_from_codex",
+        }
+
+        _session, forwarded_body = store.begin_request(
+            SESSION_ID,
+            body,
+            {"x-codex-session-id": SESSION_ID},
+        )
+
+        assert message_text(forwarded_body["input"][-1]) == proxy_server.MANUAL_LOCAL_COMPACT_PROMPT
+
+
+def test_override_local_compact_replaces_prompt_and_removes_previous_response_id() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        store = proxy_server.ProxyStore(Path(temp_dir) / "proxy_state.json")
+        store.sessions[SESSION_ID] = proxy_server.ProxySession(
+            id=SESSION_ID,
+            title="Codex fake",
+            transcript=[record("user", CODEX_ORIGINAL_TEXT)],
+            edited_transcript=[record("user", EDITED_TEXT)],
+            status="override",
+        )
+        body = {
+            "input": [
+                proxy_server.provider_message("user", CODEX_ORIGINAL_TEXT),
+                proxy_server.provider_message("user", f"{proxy_server.LOCAL_COMPACT_PROMPT_PREFIX}\nSummarize."),
+            ],
+            "previous_response_id": "resp_from_raw_context",
+        }
+
+        _session, forwarded_body = store.begin_request(
+            SESSION_ID,
+            body,
+            {"x-codex-session-id": SESSION_ID},
+        )
+
+        forwarded_text = json.dumps(forwarded_body, ensure_ascii=False)
+        assert EDITED_TEXT in forwarded_text
+        assert CODEX_ORIGINAL_TEXT not in forwarded_text
+        assert message_text(forwarded_body["input"][-1]) == proxy_server.MANUAL_LOCAL_COMPACT_PROMPT
+        assert "previous_response_id" not in forwarded_body
+        assert store.sessions[SESSION_ID].request_log[-1]["kind"] == "local_compact"
+
+
+def test_assistant_provider_items_are_deduped_by_logical_tool_identity() -> None:
+    previous_call = {
+        "type": "function_call",
+        "call_id": TOOL_CALL_ID,
+        "name": "shell_command",
+        "arguments": "{}",
+    }
+    updated_call = {
+        "type": "function_call",
+        "call_id": TOOL_CALL_ID,
+        "name": "shell_command",
+        "arguments": json.dumps({"command": "Get-ChildItem -Force"}),
+    }
+    previous_output = {
+        "type": "function_call_output",
+        "call_id": TOOL_CALL_ID,
+        "output": "partial",
+    }
+    updated_output = {
+        "type": "function_call_output",
+        "call_id": TOOL_CALL_ID,
+        "output": "README.md\nproxy_server.py",
+    }
+
+    merged = proxy_server.append_assistant_response_record(
+        [proxy_server.transcript_record("assistant", PRE_TOOL_TEXT, [previous_call, previous_output])],
+        PRE_TOOL_TEXT,
+        [updated_call, updated_output],
+    )
+
+    provider_items = merged[-1]["providerItems"]
+    assert provider_items[0].get("type") == "message"
+    assert provider_items[0].get("role") == "assistant"
+    assert message_text(provider_items[0]) == PRE_TOOL_TEXT
+    assert provider_items[1:] == [updated_call, updated_output]
+    assert merged[-1]["toolEvents"][0]["raw_output"] == "README.md\nproxy_server.py"
 
 
 def test_tool_output_request_with_override_does_not_restore_raw_context() -> None:
@@ -538,6 +777,68 @@ def test_tool_output_request_with_override_does_not_restore_raw_context() -> Non
         assert EDITED_TEXT in edited_texts
         assert CODEX_ORIGINAL_TEXT not in edited_texts
         assert FINAL_TEXT in edited_texts[-1]
+
+
+def test_auto_compact_summary_is_not_duplicated_during_override_tool_continuations() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        store = proxy_server.ProxyStore(Path(temp_dir) / "proxy_state.json")
+        summary_text = f"{proxy_server.LOCAL_COMPACT_SUMMARY_PREFIX}\n\nAUTO_SUMMARY"
+        summary_record = record("user", summary_text)
+        assistant_items = [
+            proxy_server.provider_message("assistant", PRE_TOOL_TEXT),
+            {
+                "type": "function_call",
+                "call_id": TOOL_CALL_ID,
+                "name": "shell_command",
+                "arguments": json.dumps({"command": "Get-ChildItem -Force"}),
+            },
+            {
+                "type": "function_call_output",
+                "call_id": TOOL_CALL_ID,
+                "output": "README.md\nproxy_server.py",
+            },
+        ]
+        assistant_record = proxy_server.transcript_record("assistant", PRE_TOOL_TEXT, assistant_items)
+        store.sessions[SESSION_ID] = proxy_server.ProxySession(
+            id=SESSION_ID,
+            title="Codex fake",
+            transcript=[record("user", USER_PROMPT), summary_record],
+            edited_transcript=[record("user", USER_PROMPT), summary_record, assistant_record],
+            status="override",
+        )
+        tool_body = {
+            "input": [
+                proxy_server.provider_message("user", USER_PROMPT),
+                proxy_server.provider_message("user", summary_text),
+                *assistant_items,
+                proxy_server.provider_message("user", summary_text),
+                *assistant_items,
+            ],
+            "previous_response_id": "resp_after_auto_compact",
+        }
+
+        forwarded_lengths = []
+        for _ in range(3):
+            store.begin_request(SESSION_ID, tool_body, {"x-codex-session-id": SESSION_ID})
+            forwarded_input = store.sessions[SESSION_ID].request_log[-1]["forwarded_body"]["input"]
+            forwarded_lengths.append(len(forwarded_input))
+            forwarded_transcript = proxy_server.input_items_to_transcript(forwarded_input)
+            assert sum(
+                1
+                for item in forwarded_transcript
+                if proxy_server.is_local_compact_summary_text(str(item.get("text") or ""))
+            ) == 1
+
+        session = store.sessions[SESSION_ID]
+        pending = session.pending_transcript or []
+        assert [item["role"] for item in pending] == ["user", "user", "assistant"]
+        assert sum(
+            1
+            for item in pending
+            if proxy_server.is_local_compact_summary_text(str(item.get("text") or ""))
+        ) == 1
+        assert pending[-1]["text"] == PRE_TOOL_TEXT
+        assert forwarded_lengths == [forwarded_lengths[0]] * len(forwarded_lengths)
 
 
 def test_tool_turn_stays_single_assistant_record() -> None:
@@ -1623,7 +1924,8 @@ def test_local_compact_response_replaces_transcript_with_readable_summary() -> N
 
         assert session is not None
         assert session["status"] == "compacting"
-        assert forwarded["input"] == body["input"]
+        assert forwarded["input"][:-1] == body["input"][:-1]
+        assert message_text(forwarded["input"][-1]) == proxy_server.MANUAL_LOCAL_COMPACT_PROMPT
         assert len(session["transcript"]) == 4
         assert session["transcript"][-1]["text"] == "assistant answer that should be summarized"
 
@@ -1796,7 +2098,17 @@ def main() -> None:
     test_compact_without_override_preserves_codex_input()
     test_compact_override_reinjects_fresh_initial_context()
     test_request_without_override_preserves_codex_body()
-    test_local_compact_without_override_preserves_codex_body()
+    test_local_compact_without_override_replaces_manual_prompt()
+    test_replacement_compact_prompts_still_count_as_compact_prompts()
+    test_clean_transcript_keeps_latest_local_compact_summary()
+    test_local_auto_compact_replaces_prompt_with_concise_continuation_prompt()
+    test_local_compact_prompt_replacement_preserves_input_item_shape()
+    test_same_turn_local_compact_with_assistant_text_uses_auto_prompt()
+    test_new_turn_local_compact_with_assistant_text_uses_manual_prompt()
+    test_running_status_alone_does_not_force_auto_compact_prompt()
+    test_override_local_compact_replaces_prompt_and_removes_previous_response_id()
+    test_assistant_provider_items_are_deduped_by_logical_tool_identity()
+    test_auto_compact_summary_is_not_duplicated_during_override_tool_continuations()
     test_tool_turn_stays_single_assistant_record()
     test_codex_response_item_types_roundtrip()
     test_shell_tool_output_display_metadata_is_reconstructed()

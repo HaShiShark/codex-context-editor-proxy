@@ -52,6 +52,125 @@ LOCAL_COMPACT_SUMMARY_PREFIX = (
     "Use this to build on the work that has already been done and avoid duplicating work. "
     "Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:"
 )
+MANUAL_LOCAL_COMPACT_PROMPT = """Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.
+This summary should be thorough in capturing technical details, code patterns, and architectural decisions that would be essential for continuing development work without losing context.
+
+Before providing your final summary, wrap your analysis in <analysis> tags to organize your thoughts and ensure you've covered all necessary points. In your analysis process:
+
+1. Chronologically analyze each message and section of the conversation. For each section thoroughly identify:
+   - The user's explicit requests and intents
+   - Your approach to addressing the user's requests
+   - Key decisions, technical concepts and code patterns
+   - Specific details like:
+     - file names
+     - full code snippets
+     - function signatures
+     - file edits
+   - Errors that you ran into and how you fixed them
+   - Pay special attention to specific user feedback that you received, especially if the user told you to do something differently.
+2. Double-check for technical accuracy and completeness, addressing each required element thoroughly.
+
+Your summary should include the following sections:
+
+1. Primary Request and Intent: Capture all of the user's explicit requests and intents in detail
+2. Key Technical Concepts: List all important technical concepts, technologies, and frameworks discussed.
+3. Files and Code Sections: Enumerate specific files and code sections examined, modified, or created. Pay special attention to the most recent messages and include full code snippets where applicable and include a summary of why this file read or edit is important.
+4. Errors and fixes: List all errors that you ran into, and how you fixed them. Pay special attention to specific user feedback that you received, especially if the user told you to do something differently.
+5. Problem Solving: Document problems solved and any ongoing troubleshooting efforts.
+6. All user messages: List ALL user messages that are not tool results. These are critical for understanding the users' feedback and changing intent.
+7. Pending Tasks: Outline any pending tasks that you have explicitly been asked to work on.
+8. Current Work: Describe in detail precisely what was being worked on immediately before this summary request, paying special attention to the most recent messages from both user and assistant. Include file names and code snippets where applicable.
+9. Optional Next Step: List the next step that you will take that is related to the most recent work you were doing. IMPORTANT: ensure that this step is DIRECTLY in line with the user's most recent explicit requests, and the task you were working on immediately before this summary request. If your last task was concluded, then only list next steps if they are explicitly in line with the users request. Do not start on tangential requests or really old requests that were already completed without confirming with the user first.
+                       If there is a next step, include direct quotes from the most recent conversation showing exactly what task you were working on and where you left off. This should be verbatim to ensure there's no drift in task interpretation.
+
+Here's an example of how your output should be structured:
+
+<example>
+<analysis>
+[Your thought process, ensuring all points are covered thoroughly and accurately]
+</analysis>
+
+<summary>
+1. Primary Request and Intent:
+   [Detailed description]
+
+2. Key Technical Concepts:
+   - [Concept 1]
+   - [Concept 2]
+   - [...]
+
+3. Files and Code Sections:
+   - [File Name 1]
+      - [Summary of why this file is important]
+      - [Summary of the changes made to this file, if any]
+      - [Important Code Snippet]
+   - [File Name 2]
+      - [Important Code Snippet]
+   - [...]
+
+4. Errors and fixes:
+    - [Detailed description of error 1]:
+      - [How you fixed the error]
+      - [User feedback on the error if any]
+    - [...]
+
+5. Problem Solving:
+   [Description of solved problems and ongoing troubleshooting]
+
+6. All user messages:
+    - [Detailed non tool use user message]
+    - [...]
+
+7. Pending Tasks:
+   - [Task 1]
+   - [Task 2]
+   - [...]
+
+8. Current Work:
+   [Precise description of current work]
+
+9. Optional Next Step:
+   [Optional Next step to take]
+
+</summary>
+</example>
+
+Please provide your summary based on the conversation so far, following this structure and ensuring precision and thoroughness in your response.
+
+There may be additional summarization instructions provided in the included context. If so, remember to follow these instructions when creating the above summary. Examples of instructions include:
+<example>
+## Compact Instructions
+When summarizing the conversation focus on typescript code changes and also remember the mistakes you made and how you fixed them.
+</example>
+
+<example>
+# Summary instructions
+When you are using compact - please focus on test output and code changes. Include file reads verbatim.
+</example>"""
+AUTO_LOCAL_COMPACT_PROMPT = """You have been working on the task described above but have not yet completed it. Write a continuation summary that will allow you (or another instance of yourself) to resume work efficiently in a future context window where the conversation history will be replaced with this summary. Your summary should be structured, concise, and actionable. Include:
+1. Task Overview
+The user's core request and success criteria
+Any clarifications or constraints they specified
+2. Current State
+What has been completed so far
+Files created, modified, or analyzed (with paths if relevant)
+Key outputs or artifacts produced
+3. Important Discoveries
+Technical constraints or requirements uncovered
+Decisions made and their rationale
+Errors encountered and how they were resolved
+What approaches were tried that didn't work (and why)
+4. Next Steps
+Specific actions needed to complete the task
+Any blockers or open questions to resolve
+Priority order if multiple steps remain
+5. Context to Preserve
+User preferences or style requirements
+Domain-specific details that aren't obvious
+Any promises made to the user
+Be concise but complete—err on the side of including information that would prevent duplicate work or repeated mistakes. Write in a way that enables immediate resumption of the task.
+Wrap your summary in <summary></summary> tags."""
+CUSTOM_LOCAL_COMPACT_PROMPTS = (MANUAL_LOCAL_COMPACT_PROMPT, AUTO_LOCAL_COMPACT_PROMPT)
 _UPSTREAM_AUTH_LOCK = threading.Lock()
 _UPSTREAM_AUTH_HEADERS: dict[str, str] = {}
 CODEX_AUTH_PATH = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "auth.json"
@@ -1110,11 +1229,40 @@ def strip_context_edit_notice_records(transcript: list[dict[str, Any]]) -> list[
 
 
 def is_local_compact_prompt_text(text: str) -> bool:
-    return " ".join(str(text or "").split()).startswith(LOCAL_COMPACT_PROMPT_PREFIX)
+    normalized = " ".join(str(text or "").split())
+    return normalized.startswith(LOCAL_COMPACT_PROMPT_PREFIX) or str(text or "") in CUSTOM_LOCAL_COMPACT_PROMPTS
 
 
 def is_local_compact_summary_text(text: str) -> bool:
     return str(text or "").startswith(f"{LOCAL_COMPACT_SUMMARY_PREFIX}\n\n")
+
+
+def is_local_compact_summary_record(record: dict[str, Any]) -> bool:
+    return (
+        str(record.get("role") or "") == "user"
+        and is_local_compact_summary_text(compact_text(record.get("text")))
+    )
+
+
+def local_compact_summary_text(record: dict[str, Any]) -> str:
+    return compact_text(record.get("text")) if is_local_compact_summary_record(record) else ""
+
+
+def dedupe_local_compact_summary_records(transcript: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summary_indexes = [
+        index
+        for index, record in enumerate(transcript)
+        if is_local_compact_summary_record(record)
+    ]
+    if len(summary_indexes) <= 1:
+        return copy.deepcopy(transcript)
+
+    keep_index = summary_indexes[-1]
+    return [
+        copy.deepcopy(record)
+        for index, record in enumerate(transcript)
+        if not is_local_compact_summary_record(record) or index == keep_index
+    ]
 
 
 def is_initial_context_prefix_record(record: dict[str, Any]) -> bool:
@@ -1169,6 +1317,118 @@ def local_compact_source_from_transcript(transcript: list[dict[str, Any]]) -> li
     return records[:-1]
 
 
+def request_turn_metadata(headers: dict[str, str]) -> str:
+    return str(headers.get("x-codex-turn-metadata") or headers.get("X-Codex-Turn-Metadata") or "")
+
+
+def assistant_record_ends_with_tool_activity(record: dict[str, Any]) -> bool:
+    if str(record.get("role") or "") != "assistant":
+        return False
+    provider_items = record.get("providerItems")
+    if not isinstance(provider_items, list):
+        return False
+    for item in reversed(provider_items):
+        if not isinstance(item, dict):
+            continue
+        return str(item.get("type") or "") in TOOL_CALL_ITEM_TYPES | TOOL_OUTPUT_ITEM_TYPES
+    return False
+
+
+def is_same_turn_local_compact(
+    current_turn_metadata: str,
+    previous_turn_metadata: str,
+) -> bool:
+    return bool(current_turn_metadata and previous_turn_metadata and current_turn_metadata == previous_turn_metadata)
+
+
+def is_auto_local_compact_source(
+    source_transcript: list[dict[str, Any]],
+    current_turn_metadata: str = "",
+    previous_turn_metadata: str = "",
+) -> bool:
+    if is_same_turn_local_compact(current_turn_metadata, previous_turn_metadata):
+        return True
+    source = clean_transcript(source_transcript)
+    if not source:
+        return False
+    return assistant_record_ends_with_tool_activity(source[-1])
+
+
+def replacement_local_compact_prompt(
+    source_transcript: list[dict[str, Any]],
+    current_turn_metadata: str = "",
+    previous_turn_metadata: str = "",
+) -> str:
+    if is_auto_local_compact_source(source_transcript, current_turn_metadata, previous_turn_metadata):
+        return AUTO_LOCAL_COMPACT_PROMPT
+    return MANUAL_LOCAL_COMPACT_PROMPT
+
+
+def replace_last_local_compact_prompt(
+    transcript: list[dict[str, Any]],
+    replacement_prompt: str,
+) -> list[dict[str, Any]]:
+    records = clean_transcript(transcript)
+    if not records:
+        return records
+    last_record = records[-1]
+    if str(last_record.get("role") or "") != "user":
+        return records
+    if not is_local_compact_prompt_text(compact_text(last_record.get("text"))):
+        return records
+    records[-1] = transcript_record("user", replacement_prompt, [provider_message("user", replacement_prompt)])
+    return clean_transcript(records)
+
+
+def message_item_with_text(item: dict[str, Any], text: str) -> dict[str, Any]:
+    next_item = copy.deepcopy(item)
+    content = next_item.get("content")
+    if isinstance(content, str):
+        next_item["content"] = text
+    elif isinstance(content, list):
+        replaced = False
+        next_content: list[Any] = []
+        for content_item in content:
+            if isinstance(content_item, dict) and not replaced and (
+                "text" in content_item
+                or content_item.get("type") in {"input_text", "output_text"}
+            ):
+                next_content.append({**content_item, "text": text})
+                replaced = True
+            else:
+                next_content.append(copy.deepcopy(content_item))
+        next_item["content"] = next_content if replaced else [{"type": "input_text", "text": text}]
+    elif isinstance(content, dict):
+        if "text" in content or content.get("type") in {"input_text", "output_text"}:
+            next_item["content"] = {**content, "text": text}
+        else:
+            next_item["content"] = {"type": "input_text", "text": text}
+    else:
+        next_item["content"] = text
+    if "text" in next_item:
+        next_item["text"] = text
+    return next_item
+
+
+def replace_last_local_compact_prompt_input(input_items: Any, replacement_prompt: str) -> Any:
+    if isinstance(input_items, str):
+        return replacement_prompt if is_local_compact_prompt_text(input_items) else input_items
+    if not isinstance(input_items, list):
+        return input_items
+    replaced_items = [copy.deepcopy(item) for item in input_items]
+    for index in range(len(replaced_items) - 1, -1, -1):
+        item = replaced_items[index]
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "message" or item.get("role") != "user":
+            return input_items
+        if not is_local_compact_prompt_text(read_message_text(item)):
+            return input_items
+        replaced_items[index] = message_item_with_text(item, replacement_prompt)
+        return replaced_items
+    return input_items
+
+
 def local_compacted_transcript(source_transcript: list[dict[str, Any]], assistant_summary_text: str) -> list[dict[str, Any]]:
     retained: list[dict[str, Any]] = []
     for record in clean_transcript(source_transcript):
@@ -1200,6 +1460,7 @@ class ProxySession:
     local_compact_source_transcript: list[dict[str, Any]] | None = None
     request_log: list[dict[str, Any]] = field(default_factory=list)
     response_items: list[dict[str, Any]] = field(default_factory=list)
+    last_turn_metadata_header: str = ""
     last_error: str = ""
     created_at: str = field(default_factory=utc_timestamp)
     updated_at: str = field(default_factory=utc_timestamp)
@@ -1263,6 +1524,7 @@ class ProxyStore:
                 else None,
                 request_log=raw.get("request_log") if isinstance(raw.get("request_log"), list) else [],
                 response_items=raw.get("response_items") if isinstance(raw.get("response_items"), list) else [],
+                last_turn_metadata_header=str(raw.get("last_turn_metadata_header") or ""),
                 last_error=str(raw.get("last_error") or ""),
                 created_at=str(raw.get("created_at") or utc_timestamp()),
                 updated_at=str(raw.get("updated_at") or utc_timestamp()),
@@ -1281,6 +1543,7 @@ class ProxyStore:
                     "transcript": session.transcript,
                     "edited_transcript": session.edited_transcript,
                     "pending_transcript": session.pending_transcript,
+                    "last_turn_metadata_header": session.last_turn_metadata_header,
                     "last_error": session.last_error,
                     "created_at": session.created_at,
                     "updated_at": session.updated_at,
@@ -1303,6 +1566,8 @@ class ProxyStore:
             source_transcript = strip_context_edit_notice_records(
                 input_items_to_transcript(body.get("input"))
             )
+            current_turn_metadata = request_turn_metadata(headers)
+            previous_turn_metadata = session.last_turn_metadata_header
             if session.edited_transcript is not None:
                 merged_body_transcript = merge_override_transcript(
                     strip_initial_context_prefix_records(
@@ -1323,6 +1588,8 @@ class ProxyStore:
                     request_body["input"] = drop_unpaired_tool_items(transcript_to_input_items(forwarded_transcript))
                     request_body.pop("previous_response_id", None)
                     session.status = "running"
+                    if current_turn_metadata:
+                        session.last_turn_metadata_header = current_turn_metadata
                     session.last_error = ""
                     session.updated_at = utc_timestamp()
                     session.request_log.append(
@@ -1341,7 +1608,15 @@ class ProxyStore:
                 if compact_source is not None:
                     session.local_compact_source_transcript = compact_source
                     session.pending_transcript = None
-                    request_body["input"] = drop_unpaired_tool_items(transcript_to_input_items(forwarded_transcript))
+                    compact_prompt_transcript = replace_last_local_compact_prompt(
+                        forwarded_transcript,
+                        replacement_local_compact_prompt(
+                            compact_source,
+                            current_turn_metadata,
+                            previous_turn_metadata,
+                        ),
+                    )
+                    request_body["input"] = drop_unpaired_tool_items(transcript_to_input_items(compact_prompt_transcript))
                     request_body.pop("previous_response_id", None)
                     session.status = "compacting"
                     session.last_error = ""
@@ -1363,12 +1638,22 @@ class ProxyStore:
                 request_body["input"] = drop_unpaired_tool_items(transcript_to_input_items(forwarded_transcript))
                 request_body.pop("previous_response_id", None)
                 session.status = "running"
+                if current_turn_metadata:
+                    session.last_turn_metadata_header = current_turn_metadata
             else:
                 compact_source = local_compact_source_from_transcript(source_transcript)
                 if compact_source is not None:
                     session.local_compact_source_transcript = compact_source
                     session.transcript = compact_source
                     session.pending_transcript = None
+                    request_body["input"] = replace_last_local_compact_prompt_input(
+                        body.get("input"),
+                        replacement_local_compact_prompt(
+                            compact_source,
+                            current_turn_metadata,
+                            previous_turn_metadata,
+                        ),
+                    )
                     session.status = "compacting"
                     session.last_error = ""
                     session.updated_at = utc_timestamp()
@@ -1388,6 +1673,8 @@ class ProxyStore:
                 session.pending_transcript = None
                 session.status = "running"
                 session.transcript = with_running_assistant(source_transcript)
+                if current_turn_metadata:
+                    session.last_turn_metadata_header = current_turn_metadata
             session.last_error = ""
             session.updated_at = utc_timestamp()
             session.request_log.append(
@@ -1643,6 +1930,8 @@ def clean_transcript(transcript: list[dict[str, Any]] | None) -> list[dict[str, 
     if not isinstance(transcript, list):
         return []
     records = [copy.deepcopy(record) for record in transcript if isinstance(record, dict) and not is_running_assistant(record)]
+    records = coalesce_adjacent_assistant_records(records)
+    records = dedupe_local_compact_summary_records(records)
     return coalesce_adjacent_assistant_records(records)
 
 
@@ -1656,6 +1945,46 @@ def coalesce_adjacent_assistant_records(transcript: list[dict[str, Any]]) -> lis
         else:
             merged.append(copy.deepcopy(record))
     return merged
+
+
+def provider_item_signature(item: dict[str, Any]) -> str:
+    return json.dumps(item, sort_keys=True, ensure_ascii=False, default=str)
+
+
+def provider_item_logical_key(item: dict[str, Any]) -> tuple[str, str] | None:
+    item_type = str(item.get("type") or "")
+    if item_type not in TOOL_CALL_ITEM_TYPES | TOOL_OUTPUT_ITEM_TYPES:
+        return None
+    call_id = str(item.get("call_id") or item.get("id") or "").strip()
+    return (item_type, call_id) if call_id else None
+
+
+def append_unique_provider_items(
+    existing_items: list[dict[str, Any]],
+    next_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    combined = copy.deepcopy(existing_items)
+    seen = {provider_item_signature(item) for item in combined}
+    logical_indexes = {
+        logical_key: index
+        for index, item in enumerate(combined)
+        if (logical_key := provider_item_logical_key(item)) is not None
+    }
+    for item in next_items:
+        next_item = copy.deepcopy(item)
+        logical_key = provider_item_logical_key(next_item)
+        if logical_key is not None and logical_key in logical_indexes:
+            combined[logical_indexes[logical_key]] = next_item
+            seen = {provider_item_signature(existing) for existing in combined}
+            continue
+        signature = provider_item_signature(next_item)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        if logical_key is not None:
+            logical_indexes[logical_key] = len(combined)
+        combined.append(next_item)
+    return combined
 
 
 def append_assistant_response_record(
@@ -1674,7 +2003,10 @@ def append_assistant_response_record(
         combined_items: list[dict[str, Any]] = []
         if isinstance(previous_items, list):
             combined_items.extend(copy.deepcopy(item) for item in previous_items if isinstance(item, dict))
-        combined_items.extend(copy.deepcopy(item) for item in response_items if isinstance(item, dict))
+        combined_items = append_unique_provider_items(
+            combined_items,
+            [copy.deepcopy(item) for item in response_items if isinstance(item, dict)],
+        )
         combined_text = combine_assistant_texts(compact_text(previous.get("text")), assistant_text)
         next_transcript[-1] = transcript_record("assistant", combined_text, combined_items)
         return next_transcript
@@ -1717,8 +2049,11 @@ def append_non_duplicate(base: list[dict[str, Any]], tail: list[dict[str, Any]])
     for record in tail:
         if merged and transcript_record_signature(merged[-1]) == transcript_record_signature(record):
             continue
+        summary_text = local_compact_summary_text(record)
+        if summary_text and any(local_compact_summary_text(existing) == summary_text for existing in merged):
+            continue
         merged.append(copy.deepcopy(record))
-    return merged
+    return clean_transcript(merged)
 
 
 def latest_user_turn_tail(source_transcript: list[dict[str, Any]]) -> list[dict[str, Any]]:
