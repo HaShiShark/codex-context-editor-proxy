@@ -107,6 +107,7 @@ class MockModelsUpstream(BaseHTTPRequestHandler):
 
 class MockResponsesUpstream(BaseHTTPRequestHandler):
     requests: list[dict[str, Any]] = []
+    response_event = {"type": "response.completed", "response": {"model": "gpt-test", "output": []}}
 
     def log_message(self, _format: str, *_args: Any) -> None:
         return
@@ -121,7 +122,7 @@ class MockResponsesUpstream(BaseHTTPRequestHandler):
                 "body": body,
             }
         )
-        payload = b'data: {"type":"response.completed","response":{"output":[]}}\n\n'
+        payload = f"data: {json.dumps(self.response_event, ensure_ascii=False)}\n\n".encode("utf-8")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Content-Length", str(len(payload)))
@@ -349,6 +350,168 @@ def test_request_without_override_preserves_codex_body() -> None:
         request_log = store.sessions[SESSION_ID].request_log
         assert request_log[-1]["kind"] == "mirror_passthrough"
         assert request_log[-1]["forwarded_body"] == original_body
+
+
+def test_proxy_usage_summary_records_and_resets_by_session() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        store = proxy_server.ProxyStore(Path(temp_dir) / "proxy_state.json")
+        store.sessions[SESSION_ID] = proxy_server.ProxySession(
+            id=SESSION_ID,
+            title="Codex fake",
+            transcript=[record("user", USER_PROMPT)],
+        )
+
+        store.record_usage(
+            SESSION_ID,
+            "main",
+            "gpt-test",
+            {
+                "input_tokens": 100,
+                "input_tokens_details": {"cached_tokens": 40},
+                "output_tokens": 20,
+                "output_tokens_details": {"reasoning_tokens": 5},
+                "total_tokens": 120,
+            },
+        )
+        store.record_usage(
+            SESSION_ID,
+            "context_workbench",
+            "gpt-context",
+            {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+            },
+        )
+
+        payload = store.get_session(SESSION_ID)
+        assert payload is not None
+        assert payload["active_transcript"] == payload["transcript"]
+        assert "usage_events" not in payload
+        summary = payload["usage_summary"]
+        assert summary["request_count"] == 2
+        assert summary["input_tokens"] == 110
+        assert summary["cached_input_tokens"] == 40
+        assert summary["non_cached_input_tokens"] == 70
+        assert summary["output_tokens"] == 25
+        assert summary["reasoning_tokens"] == 5
+        assert summary["total_tokens"] == 135
+        assert summary["known_cost_usd"] > 0
+        assert summary["unknown_cost_request_count"] == 0
+        assert summary["by_kind"]["main"]["request_count"] == 1
+        assert summary["by_kind"]["context_workbench"]["request_count"] == 1
+        listed_session = store.list_sessions()["sessions"][0]
+        assert listed_session["usage_summary"]["request_count"] == 2
+        assert "transcript" not in listed_session
+        assert "active_transcript" not in listed_session
+        assert "raw_transcript" not in listed_session
+
+        reset = store.reset_usage(SESSION_ID)
+        assert reset["cleared_count"] == 2
+        assert reset["summary"]["request_count"] == 0
+        assert store.session_usage(SESSION_ID)["summary"]["request_count"] == 0
+
+
+def test_proxy_usage_routes_record_main_and_context_workbench() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        original_store = proxy_server.STORE
+        original_chatgpt_base_url = proxy_server.CHATGPT_UPSTREAM_BASE_URL
+        original_openai_base_url = proxy_server.OPENAI_UPSTREAM_BASE_URL
+        MockResponsesUpstream.requests = []
+        MockResponsesUpstream.response_event = {
+            "type": "response.completed",
+            "response": {
+                "model": "gpt-test",
+                "output": [],
+                "usage": {
+                    "input_tokens": 50,
+                    "input_tokens_details": {"cached_tokens": 10},
+                    "output_tokens": 15,
+                    "total_tokens": 65,
+                },
+            },
+        }
+        upstream = start_server(MockResponsesUpstream)
+        proxy = start_server(proxy_server.Handler)
+        proxy_server.STORE = proxy_server.ProxyStore(Path(temp_dir) / "proxy_state.json")
+        proxy_server.CHATGPT_UPSTREAM_BASE_URL = f"http://127.0.0.1:{upstream.server_port}/backend-api/codex"
+        proxy_server.OPENAI_UPSTREAM_BASE_URL = f"http://127.0.0.1:{upstream.server_port}/v1"
+
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", proxy.server_port, timeout=20)
+            request_body = {
+                "model": "gpt-test",
+                "input": [proxy_server.provider_message("user", USER_PROMPT)],
+            }
+            try:
+                conn.request(
+                    "POST",
+                    "/v1/responses",
+                    body=json.dumps(request_body).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": "Bearer real-token",
+                        "x-codex-session-id": SESSION_ID,
+                    },
+                )
+                response = conn.getresponse()
+                response.read()
+                assert response.status == HTTPStatus.OK
+
+                conn.request(
+                    "POST",
+                    "/v1/responses",
+                    body=json.dumps(request_body).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": "Bearer real-token",
+                        "x-hash-context-internal": "context-workbench",
+                        "x-hash-context-session-id": SESSION_ID,
+                    },
+                )
+                response = conn.getresponse()
+                response.read()
+                assert response.status == HTTPStatus.OK
+
+                conn.request("GET", f"/api/proxy/sessions/{SESSION_ID}/usage")
+                response = conn.getresponse()
+                usage_payload = json.loads(response.read().decode("utf-8"))
+                assert response.status == HTTPStatus.OK
+                summary = usage_payload["summary"]
+                assert summary["request_count"] == 2
+                assert summary["by_kind"]["main"]["input_tokens"] == 50
+                assert summary["by_kind"]["context_workbench"]["input_tokens"] == 50
+
+                conn.request("POST", f"/api/proxy/sessions/{SESSION_ID}/usage/reset", body=b"{}")
+                response = conn.getresponse()
+                reset_payload = json.loads(response.read().decode("utf-8"))
+                assert response.status == HTTPStatus.OK
+                assert reset_payload["cleared_count"] == 2
+                assert reset_payload["summary"]["request_count"] == 0
+            finally:
+                conn.close()
+        finally:
+            proxy.shutdown()
+            proxy.server_close()
+            upstream.shutdown()
+            upstream.server_close()
+            proxy_server.STORE = original_store
+            proxy_server.CHATGPT_UPSTREAM_BASE_URL = original_chatgpt_base_url
+            proxy_server.OPENAI_UPSTREAM_BASE_URL = original_openai_base_url
+            MockResponsesUpstream.response_event = {"type": "response.completed", "response": {"model": "gpt-test", "output": []}}
+
+
+def test_sse_completed_response_captures_usage_payload() -> None:
+    response_items: list[dict[str, Any]] = []
+    text_parts: list[str] = []
+    completed_responses: list[dict[str, Any]] = []
+    buffer = (
+        'data: {"type":"response.completed","response":{"model":"gpt-test","output":[],"usage":{"input_tokens":3,"output_tokens":2}}}\n\n'
+    )
+
+    remainder = proxy_server.parse_sse_buffer(buffer, response_items, text_parts, completed_responses)
+
+    assert remainder == ""
+    assert completed_responses[0]["usage"]["input_tokens"] == 3
 
 
 def test_clean_transcript_preserves_repeated_input_context_records() -> None:
@@ -1950,6 +2113,44 @@ def test_local_compact_response_replaces_transcript_with_readable_summary() -> N
         )
 
 
+def test_local_compact_keeps_recent_user_messages_with_token_budget() -> None:
+    previous_limit = proxy_server.LOCAL_COMPACT_USER_MESSAGE_MAX_TOKENS
+    try:
+        proxy_server.LOCAL_COMPACT_USER_MESSAGE_MAX_TOKENS = 4
+        transcript = [
+            record("user", "older user message that should be dropped"),
+            record("assistant", "assistant output that should be summarized"),
+            record("user", "middle12"),
+            record("user", "latest12"),
+        ]
+
+        compacted = proxy_server.local_compacted_transcript(transcript, REMOTE_SUMMARY_TEXT)
+
+        assert provider_texts(compacted) == [
+            "middle12",
+            "latest12",
+            f"{proxy_server.LOCAL_COMPACT_SUMMARY_PREFIX}\n\n{REMOTE_SUMMARY_TEXT}",
+        ]
+    finally:
+        proxy_server.LOCAL_COMPACT_USER_MESSAGE_MAX_TOKENS = previous_limit
+
+
+def test_local_compact_truncates_oldest_selected_user_message_at_budget() -> None:
+    previous_limit = proxy_server.LOCAL_COMPACT_USER_MESSAGE_MAX_TOKENS
+    try:
+        proxy_server.LOCAL_COMPACT_USER_MESSAGE_MAX_TOKENS = 3
+        transcript = [
+            record("user", "older user message"),
+            record("user", "latest12"),
+        ]
+
+        compacted = proxy_server.local_compacted_transcript(transcript, REMOTE_SUMMARY_TEXT)
+
+        assert provider_texts(compacted)[:2] == ["olde", "latest12"]
+    finally:
+        proxy_server.LOCAL_COMPACT_USER_MESSAGE_MAX_TOKENS = previous_limit
+
+
 def test_context_workbench_compressed_nodes_stay_independent_after_cleaning() -> None:
     transcript = [
         proxy_server.transcript_record(
@@ -2093,11 +2294,80 @@ def test_context_workbench_hides_internal_prefix_nodes_from_editing() -> None:
     assert committed[1]["text"].startswith("<environment_context>")
 
 
+def test_context_workbench_prompt_cache_key_is_stable_and_bounded() -> None:
+    session_id = "019e392a-9e23-7a33-badc-e5862b781d3f"
+
+    assert web_server.context_workbench_prompt_cache_key(session_id) == f"hash-context:{session_id}"
+
+    unsafe_key = web_server.context_workbench_prompt_cache_key(" session/with spaces/and/slashes " + "x" * 80)
+    assert unsafe_key.startswith("hash-context:session-with-spaces-and-slashes")
+    assert len(unsafe_key) <= 61
+    assert "/" not in unsafe_key
+    assert " " not in unsafe_key
+
+
+def test_internal_context_reuses_codex_session_headers() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        store = proxy_server.ProxyStore(Path(temp_dir) / "proxy_state.json")
+        turn_metadata = json.dumps(
+            {
+                "session_id": SESSION_ID,
+                "thread_id": SESSION_ID,
+                "turn_id": "turn-1",
+            }
+        )
+        store.begin_request(
+            SESSION_ID,
+            {"input": [proxy_server.provider_message("user", "hello")]},
+            {
+                "authorization": "Bearer real-token",
+                "chatgpt-account-id": "account-1",
+                "session-id": SESSION_ID,
+                "thread-id": SESSION_ID,
+                "x-client-request-id": SESSION_ID,
+                "x-codex-turn-metadata": turn_metadata,
+                "x-codex-window-id": f"{SESSION_ID}:0",
+            },
+        )
+
+        internal_headers = proxy_server.merge_codex_session_headers(
+            {"authorization": "Bearer not-needed", "x-hash-context-session-id": SESSION_ID},
+            store.codex_session_headers(SESSION_ID),
+            session_id=SESSION_ID,
+        )
+        upstream_headers = proxy_server.response_headers_for_upstream(internal_headers)
+
+        assert upstream_headers["session-id"] == SESSION_ID
+        assert upstream_headers["thread-id"] == SESSION_ID
+        assert upstream_headers["x-client-request-id"] == SESSION_ID
+        assert upstream_headers["x-codex-turn-metadata"] == turn_metadata
+        assert upstream_headers["x-codex-window-id"] == f"{SESSION_ID}:0"
+        assert "x-hash-context-session-id" not in {key.lower() for key in upstream_headers}
+
+
+def test_internal_context_synthesizes_codex_session_headers_for_old_sessions() -> None:
+    internal_headers = proxy_server.merge_codex_session_headers(
+        {"authorization": "Bearer not-needed", "x-hash-context-session-id": SESSION_ID},
+        {},
+        session_id=SESSION_ID,
+    )
+    upstream_headers = proxy_server.response_headers_for_upstream(internal_headers)
+
+    assert upstream_headers["session-id"] == SESSION_ID
+    assert upstream_headers["thread-id"] == SESSION_ID
+    assert upstream_headers["x-client-request-id"] == SESSION_ID
+    assert json.loads(upstream_headers["x-codex-turn-metadata"])["thread_id"] == SESSION_ID
+    assert "x-hash-context-session-id" not in {key.lower() for key in upstream_headers}
+
+
 def main() -> None:
     test_drop_unpaired_tool_items_preserves_only_complete_pairs()
     test_compact_without_override_preserves_codex_input()
     test_compact_override_reinjects_fresh_initial_context()
     test_request_without_override_preserves_codex_body()
+    test_proxy_usage_summary_records_and_resets_by_session()
+    test_proxy_usage_routes_record_main_and_context_workbench()
+    test_sse_completed_response_captures_usage_payload()
     test_local_compact_without_override_replaces_manual_prompt()
     test_replacement_compact_prompts_still_count_as_compact_prompts()
     test_clean_transcript_keeps_latest_local_compact_summary()
@@ -2130,9 +2400,14 @@ def main() -> None:
     test_compaction_summary_visible_text_without_encrypted_content()
     test_compaction_visible_text_falls_back_to_encrypted_content()
     test_local_compact_response_replaces_transcript_with_readable_summary()
+    test_local_compact_keeps_recent_user_messages_with_token_budget()
+    test_local_compact_truncates_oldest_selected_user_message_at_budget()
     test_context_workbench_compressed_nodes_stay_independent_after_cleaning()
     test_context_workbench_compress_nodes_replaces_tool_heavy_node()
     test_context_workbench_hides_internal_prefix_nodes_from_editing()
+    test_context_workbench_prompt_cache_key_is_stable_and_bounded()
+    test_internal_context_reuses_codex_session_headers()
+    test_internal_context_synthesizes_codex_session_headers_for_old_sessions()
 
     with tempfile.TemporaryDirectory() as temp_dir:
         upstream = start_server(MockModelsUpstream)

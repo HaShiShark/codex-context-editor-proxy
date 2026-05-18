@@ -15,6 +15,7 @@ import type {
   ArchiveProjectSessionsResponse,
   PendingContextRestore,
   ProjectActionResponse,
+  ProxyUsageSummary,
   ProviderModelCandidatesResponse,
   ProviderModelsResponse,
   ResetSessionResponse,
@@ -180,16 +181,30 @@ function normalizeProviderModelCandidatesResponse(
   };
 }
 
-export function fetchInit(): Promise<InitPayload> {
-  return apiFetch<InitPayload>('/api/init');
+export function fetchInit(sessionId?: string, options: { includeConversation?: boolean } = {}): Promise<InitPayload> {
+  const safeSessionId = sessionId?.trim();
+  const params = new URLSearchParams();
+  if (safeSessionId) {
+    params.set('session_id', safeSessionId);
+  }
+  if (options.includeConversation === false) {
+    params.set('include_conversation', '0');
+  }
+  const query = params.toString() ? `?${params.toString()}` : '';
+  return apiFetch<InitPayload>(`/api/init${query}`);
 }
 
 export function fetchSettings(): Promise<SettingsResponse> {
   return apiFetch<SettingsResponse>('/api/settings');
 }
 
-export function fetchContextWorkbenchSettings(): Promise<ContextWorkbenchSettingsResponse> {
-  return apiFetch<ContextWorkbenchSettingsResponse>('/api/context-workbench-settings');
+export function fetchContextWorkbenchSettings(options: { refreshModels?: boolean } = {}): Promise<ContextWorkbenchSettingsResponse> {
+  const params = new URLSearchParams();
+  if (options.refreshModels) {
+    params.set('refresh_models', '1');
+  }
+  const query = params.toString() ? `?${params.toString()}` : '';
+  return apiFetch<ContextWorkbenchSettingsResponse>(`/api/context-workbench-settings${query}`);
 }
 
 export function saveSettingsRequest(payload: {
@@ -354,14 +369,17 @@ export interface ProxySessionSummary {
   id: string;
   title: string;
   status: 'mirror' | 'running' | 'compacting' | 'override' | 'error' | string;
-  transcript: TranscriptRecord[];
+  transcript?: TranscriptRecord[];
+  active_transcript?: TranscriptRecord[];
   raw_transcript?: TranscriptRecord[];
   edited_transcript?: TranscriptRecord[] | null;
+  active_context_source?: 'raw' | 'committed' | 'pending' | string;
   has_override?: boolean;
   is_running?: boolean;
   last_error?: string;
   created_at?: string;
   updated_at?: string;
+  usage_summary?: ProxyUsageSummary;
 }
 
 export interface ProxySessionsResponse {
@@ -371,6 +389,16 @@ export interface ProxySessionsResponse {
 
 export function fetchProxySessionsRequest(): Promise<ProxySessionsResponse> {
   return apiFetch<ProxySessionsResponse>('/api/proxy/sessions');
+}
+
+export function fetchProxySessionRequest(sessionId: string): Promise<ProxySessionSummary> {
+  return apiFetch<ProxySessionSummary>(`/api/proxy/sessions/${encodeURIComponent(sessionId)}`);
+}
+
+export function fetchProxySessionUsageRequest(sessionId: string): Promise<{
+  summary: ProxyUsageSummary;
+}> {
+  return apiFetch<{ summary: ProxyUsageSummary }>(`/api/proxy/sessions/${encodeURIComponent(sessionId)}/usage`);
 }
 
 export function syncProxySessionRequest(payload: {
@@ -405,6 +433,16 @@ export function saveProxyOverrideRequest(sessionId: string, transcript: Transcri
 
 export function resetProxyOverrideRequest(sessionId: string): Promise<ProxySessionSummary> {
   return apiFetch<ProxySessionSummary>('/api/proxy-session-reset', {
+    method: 'POST',
+    body: JSON.stringify({ session_id: sessionId }),
+  });
+}
+
+export function resetProxyUsageRequest(sessionId: string): Promise<{
+  cleared_count: number;
+  summary: ProxyUsageSummary;
+}> {
+  return apiFetch('/api/proxy-session-usage-reset', {
     method: 'POST',
     body: JSON.stringify({ session_id: sessionId }),
   });

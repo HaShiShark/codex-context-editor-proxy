@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 from urllib import error as urllib_error
 from urllib import request as urllib_request
-from urllib.parse import quote, urlparse, urlunparse
+from urllib.parse import parse_qs, quote, urlparse, urlunparse
 
 from codex_context import is_conversation_record
 from dotenv import load_dotenv
@@ -411,6 +411,7 @@ class AppState:
 
         with self.lock:
             session = self.sessions.get(safe_session_id)
+            created_session = False
             if session is None:
                 session = SessionState(
                     session_id=safe_session_id,
@@ -425,34 +426,48 @@ class AppState:
                 )
                 self.sessions[safe_session_id] = session
                 self._insert_session_locked(session)
+                created_session = True
 
             active_mode = sanitize_text(session.active_request_mode or "").strip()
             active_request_id = sanitize_text(session.active_request_id or "").strip()
             next_transcript = normalize_transcript(transcript)
+            next_title = sanitize_text(title or "").strip() or session.title or "Codex Context"
+            should_persist = created_session
 
-            session.title = sanitize_text(title or "").strip() or session.title or "Codex Context"
-            session.scope = "chat"
-            session.project_id = None
+            if session.title != next_title:
+                session.title = next_title
+                should_persist = True
+            if session.scope != "chat":
+                session.scope = "chat"
+                should_persist = True
+            if session.project_id is not None:
+                session.project_id = None
+                should_persist = True
             if active_mode != "context":
                 transcript_changed = next_transcript != normalize_transcript(session.transcript)
-                session.transcript = next_transcript
                 if transcript_changed:
+                    session.transcript = next_transcript
                     session.pending_context_restore = None
+                    should_persist = True
             if active_mode != "context":
                 if is_running:
-                    session.active_request_mode = "main"
-                    session.active_request_id = "proxy-running"
-                    session.active_cancel_event = threading.Event()
+                    if active_mode != "main" or active_request_id != "proxy-running":
+                        session.active_request_mode = "main"
+                        session.active_request_id = "proxy-running"
+                        session.active_cancel_event = threading.Event()
+                        should_persist = True
                 elif active_mode == "main" and active_request_id == "proxy-running":
                     session.active_request_mode = None
                     session.active_request_id = None
                     session.active_cancel_event = None
-            ensure_initial_context_revision(session)
-            sync_active_context_revision_snapshot(session)
-            self._hydrate_agent_locked(session)
-            self._remove_session_from_lists_locked(session.session_id)
-            self._insert_session_locked(session)
-            self._save_state_locked()
+                    should_persist = True
+            if should_persist:
+                ensure_initial_context_revision(session)
+                sync_active_context_revision_snapshot(session)
+                self._hydrate_agent_locked(session)
+                self._remove_session_from_lists_locked(session.session_id)
+                self._insert_session_locked(session)
+                self._save_state_locked()
             return session
 
     def reset_session(self, session_id: str) -> SessionState:
@@ -868,9 +883,41 @@ class AppState:
             self._insert_session_locked(session)
             self._save_state_locked()
 
-    def bootstrap_payload(self) -> dict[str, object]:
+    def bootstrap_payload(self, session_id: str = "", include_conversation: bool = True) -> dict[str, object]:
         with self.lock:
             self._ensure_default_project_locked()
+            safe_session_id = sanitize_text(session_id or "").strip()
+            if not include_conversation:
+                conversations = {}
+            elif safe_session_id:
+                conversations = (
+                    {safe_session_id: sanitize_value(self.sessions[safe_session_id].transcript)}
+                    if safe_session_id in self.sessions
+                    else {}
+                )
+            else:
+                conversations = self._conversation_map_locked()
+            context_workbench_histories = (
+                {safe_session_id: sanitize_value(self.sessions[safe_session_id].context_workbench_history)}
+                if safe_session_id
+                and safe_session_id in self.sessions
+                and self.sessions[safe_session_id].context_workbench_history
+                else ({} if safe_session_id else self._context_workbench_history_map_locked())
+            )
+            context_revision_histories = (
+                {safe_session_id: context_revision_summaries(self.sessions[safe_session_id].context_revisions)}
+                if safe_session_id
+                and safe_session_id in self.sessions
+                and self.sessions[safe_session_id].context_revisions
+                else ({} if safe_session_id else self._context_revision_map_locked())
+            )
+            pending_context_restores = (
+                {safe_session_id: context_pending_restore_payload(self.sessions[safe_session_id].pending_context_restore)}
+                if safe_session_id
+                and safe_session_id in self.sessions
+                and self.sessions[safe_session_id].pending_context_restore
+                else ({} if safe_session_id else self._pending_context_restore_map_locked())
+            )
             return {
                 "project_name": self.settings.project_root.name or str(self.settings.project_root),
                 "project_root": str(self.settings.project_root),
@@ -880,10 +927,10 @@ class AppState:
                 "settings": settings_payload(self.settings),
                 "projects": self._projects_payload_locked(),
                 "chat_sessions": self._chat_sessions_payload_locked(),
-                "conversations": self._conversation_map_locked(),
-                "context_workbench_histories": self._context_workbench_history_map_locked(),
-                "context_revision_histories": self._context_revision_map_locked(),
-                "pending_context_restores": self._pending_context_restore_map_locked(),
+                "conversations": conversations,
+                "context_workbench_histories": context_workbench_histories,
+                "context_revision_histories": context_revision_histories,
+                "pending_context_restores": pending_context_restores,
             }
 
     def sidebar_payload(self) -> dict[str, object]:
@@ -1938,7 +1985,7 @@ def context_workbench_settings_payload(settings: Settings) -> dict[str, object]:
     return {
         "context_workbench_model": sanitize_text(settings.context_workbench_model or settings.model).strip()
         or sanitize_text(settings.model).strip()
-        or "gpt-5.4-mini",
+        or "gpt-5.5",
         "context_workbench_provider_id": CODEX_PROXY_PROVIDER_ID,
         "context_token_warning_threshold": int(settings.context_token_warning_threshold or 5000),
         "context_token_critical_threshold": int(settings.context_token_critical_threshold or 10000),
@@ -2006,7 +2053,41 @@ def debug_request_item_summary(item: Any, index: int) -> dict[str, object]:
     if item_type == "function_call":
         summary["name"] = sanitize_text(item.get("name") or "").strip()
         summary["call_id"] = sanitize_text(item.get("call_id") or "").strip()
-        summary["arguments_chars"] = len(sanitize_text(item.get("arguments") or ""))
+        arguments_text = sanitize_text(item.get("arguments") or "")
+        summary["arguments_chars"] = len(arguments_text)
+        try:
+            parsed_arguments = json.loads(arguments_text) if arguments_text.strip() else {}
+        except json.JSONDecodeError:
+            parsed_arguments = {}
+        if isinstance(parsed_arguments, dict):
+            argument_summary: dict[str, object] = {}
+            for key in [
+                "node_numbers",
+                "node_indexes",
+                "item_number",
+                "item_numbers",
+                "item_refs",
+                "title",
+                "style",
+                "reason",
+            ]:
+                if key in parsed_arguments:
+                    argument_summary[key] = sanitize_value(parsed_arguments.get(key))
+
+            for text_key in ["summary_markdown", "compressed_content"]:
+                if text_key in parsed_arguments:
+                    argument_summary[f"{text_key}_chars"] = len(sanitize_text(parsed_arguments.get(text_key) or ""))
+
+            selector = parsed_arguments.get("selector")
+            if isinstance(selector, dict):
+                argument_summary["selector_keys"] = sorted(str(key) for key in selector.keys())
+
+            operation = parsed_arguments.get("operation")
+            if isinstance(operation, dict):
+                argument_summary["operation_type"] = sanitize_text(operation.get("type") or "").strip()
+
+            if argument_summary:
+                summary["arguments_summary"] = argument_summary
         return summary
 
     if item_type == "function_call_output":
@@ -3369,7 +3450,7 @@ def build_context_workspace_snapshot(
     selected_numbers = selected_display_node_numbers(transcript, safe_selected_indexes)
     editable_entries = editable_context_node_entries(transcript)
     lines = [
-        "# 当前上下文快照",
+        "# 当前主 Codex 上下文快照",
         f"- 会话标题：{session.title}",
         f"- 会话类型：{session.scope}",
         f"- 当前节点数：{len(editable_entries)}",
@@ -3377,7 +3458,8 @@ def build_context_workspace_snapshot(
         "- 这一轮里所有 Node # 都以这份快照为准。",
         "- 系统/开发者指令和默认环境说明属于内部前缀，不在本快照中展示，也不能被选择或编辑。",
         "- 非 assistant 节点直接给全文，assistant 节点默认只给上下文地图折叠态同款首句预览，预览后面的内容你并不可见。",
-        "- 如果你需要定位某类 provider item，优先调用 find_context_items；只有确实需要完整协议层细节时，再调用 get_context_node_details。",
+        "- 压缩 assistant 节点前必须先调用 get_context_node_details 获取完整节点内容；不要用首句预览编写压缩摘要。",
+        "- 如果你需要定位或编辑 provider item，先用明确的 Node # 调用 get_context_node_details，再根据返回的 item # 继续操作。",
         "",
         "## 节点概览",
     ]
@@ -3500,6 +3582,12 @@ def latest_proxy_instruction_prefix_records() -> list[dict[str, Any]]:
     )
 
     for session in sessions:
+        latest_prefix = session.get("latest_instruction_prefix")
+        if isinstance(latest_prefix, list):
+            normalized_prefix = normalize_transcript(latest_prefix)
+            if normalized_prefix:
+                return normalized_prefix
+
         request_log = session.get("request_log")
         if not isinstance(request_log, list):
             continue
@@ -3746,12 +3834,15 @@ class ContextWorkbenchDraft:
         self.operations: list[dict[str, object]] = []
         self._draft_counter = 0
         self._revision_summary = ""
+        self._working_version = 0
 
     @property
     def has_changes(self) -> bool:
         return bool(self.operations)
 
     def _record_operation(self, operation: dict[str, object]) -> None:
+        self._working_version += 1
+        operation["working_version"] = self._working_version
         self.operations.append(operation)
         self._revision_summary = ""
 
@@ -3768,9 +3859,10 @@ class ContextWorkbenchDraft:
         self._revision_summary = safe_summary
         return {
             "payload_kind": "revision_summary",
+            "saved": True,
             "summary": safe_summary,
             "change_count": len(self.operations),
-            "working_overview": self.current_overview_items(),
+            "working_version": self._working_version,
         }
 
     def _fallback_revision_summary(self) -> str:
@@ -3922,17 +4014,7 @@ class ContextWorkbenchDraft:
         if legacy_indexes:
             return self._nodes_by_number([index + 1 for index in legacy_indexes], include_inactive=include_inactive)
 
-        if allow_selected and self.selected_node_numbers:
-            return self._nodes_by_number(self.selected_node_numbers, include_inactive=include_inactive)
-
-        target_hint = sanitize_text(arguments.get("target_hint") or "").strip()
-        if target_hint:
-            resolved_from_hint = self._resolve_target_nodes_from_hint(
-                target_hint,
-                include_inactive=include_inactive,
-            )
-            if resolved_from_hint:
-                return resolved_from_hint
+        del allow_selected
 
         if allow_all_active:
             return self.active_nodes()
@@ -3956,6 +4038,54 @@ class ContextWorkbenchDraft:
 
     def current_overview_items(self) -> list[dict[str, object]]:
         return [self._overview_for_node(node) for node in self.active_nodes()]
+
+    def compact_overview_for_node(self, node: ContextWorkbenchDraftNode) -> dict[str, object]:
+        overview = self._overview_for_node(node)
+        overview.pop("full_text", None)
+        return overview
+
+    def compact_overview_items(self, nodes: list[ContextWorkbenchDraftNode]) -> list[dict[str, object]]:
+        return [self.compact_overview_for_node(node) for node in nodes]
+
+    def final_snapshot_payload(self) -> dict[str, object]:
+        active_nodes = self.active_nodes()
+        inactive_nodes = [node for node in sorted(self.nodes, key=lambda item: item.order) if not node.active]
+        compressed_replacements: dict[int, str] = {}
+        for operation in self.operations:
+            if sanitize_text(operation.get("operation_type") or "").strip() != "compress_nodes":
+                continue
+            created_label = sanitize_text(operation.get("created_label") or "").strip()
+            if not created_label:
+                continue
+            for node_number in unique_int_list(operation.get("compressed_node_numbers") or operation.get("target_node_numbers")):
+                compressed_replacements[node_number] = created_label
+
+        active_overviews = self.compact_overview_items(active_nodes)
+        inactive_overviews: list[dict[str, object]] = []
+        for node in inactive_nodes:
+            item: dict[str, object] = {
+                "node_number": node.source_node_number,
+                "label": node.label,
+                "status": node.status,
+                "node_kind": node.kind,
+                "active": node.active,
+            }
+            if node.status == "compressed" and node.source_node_number in compressed_replacements:
+                item["replaced_by"] = compressed_replacements[node.source_node_number]
+            inactive_overviews.append(item)
+
+        return {
+            "payload_kind": "final_working_snapshot",
+            "working_version": self._working_version,
+            "active_node_count": len(active_nodes),
+            "inactive_node_count": len(inactive_nodes),
+            "total_token_estimate": sum(int(item.get("token_estimate") or 0) for item in active_overviews),
+            "tool_token_estimate": sum(int(item.get("tool_token_estimate") or 0) for item in active_overviews),
+            "selected_node_numbers": list(self.selected_node_numbers),
+            "active_nodes": active_overviews,
+            "inactive_nodes": inactive_overviews,
+            "operations": sanitize_value(self.operations),
+        }
 
     def overview_items(self, nodes: list[ContextWorkbenchDraftNode]) -> list[dict[str, object]]:
         return [self._overview_for_node(node) for node in nodes]
@@ -3990,7 +4120,7 @@ class ContextWorkbenchDraft:
                     "item_count": len(provider_items),
                     "full_detail_note": (
                         "Mutation results intentionally omit full provider_items and per-item detail to avoid repeating large node content. "
-                        "For simple delete/replace/compress steps, do not re-open node details just to verify; use this result and working_overview. "
+                        "For simple delete/replace/compress steps, do not re-open node details just to verify; use the mutation delta. "
                         "Only call get_context_node_details again when the next edit requires exact updated provider_items from the current working snapshot."
                     ),
                 }
@@ -4485,12 +4615,15 @@ class ContextWorkbenchDraft:
         changed_node_details = self.mutation_node_details(
             self._nodes_by_number(changed_nodes, include_inactive=True)
         )
+        active_nodes = self.active_nodes()
         payload: dict[str, object] = {
-            "payload_kind": "mutation_result",
+            "payload_kind": "mutation_delta",
             "summary": summary,
             "change_type": normalize_change_type(change_type),
+            "working_version": self._working_version,
             "changed_nodes": unique_int_list(changed_nodes),
-            "working_overview": self.current_overview_items(),
+            "active_node_count": len(active_nodes),
+            "inactive_node_count": len([node for node in self.nodes if not node.active]),
             "changed_node_details": changed_node_details,
         }
         if extra:
@@ -4560,30 +4693,29 @@ class ContextWorkbenchDraft:
         label = self._next_draft_label()
         heading = sanitize_text(title).strip()
         summary_text = safe_summary if not heading else f"### {heading}\n\n{safe_summary}"
-        self.nodes.append(
-            ContextWorkbenchDraftNode(
-                order=min(node.order for node in active_nodes) + 0.01,
-                label=label,
-                record={
-                    "role": "user",
-                    "text": summary_text,
-                    "attachments": [],
-                    "toolEvents": [],
-                    "blocks": [{"kind": "text", "text": summary_text}],
-                    "providerItems": [
-                        {
-                            "type": "message",
-                            "role": "user",
-                            "content": summary_text,
-                        }
-                    ],
-                },
-                active=True,
-                source_node_number=None,
-                kind="draft",
-                status="created",
-            )
+        created_node = ContextWorkbenchDraftNode(
+            order=min(node.order for node in active_nodes) + 0.01,
+            label=label,
+            record={
+                "role": "user",
+                "text": summary_text,
+                "attachments": [],
+                "toolEvents": [],
+                "blocks": [{"kind": "text", "text": summary_text}],
+                "providerItems": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": summary_text,
+                    }
+                ],
+            },
+            active=True,
+            source_node_number=None,
+            kind="draft",
+            status="created",
         )
+        self.nodes.append(created_node)
 
         summary = f"Compress nodes #{format_node_ranges(target_numbers)}"
         self._record_operation(
@@ -4605,6 +4737,7 @@ class ContextWorkbenchDraft:
             extra={
                 "compressed_node_numbers": target_numbers,
                 "created_label": label,
+                "created_node": self.compact_overview_for_node(created_node),
             },
         )
 
@@ -4796,15 +4929,15 @@ class ContextWorkbenchToolRegistry:
         self._tools = {
             definition.name: definition
             for definition in [
-                self._build_preview_selection_tool(),
                 self._build_node_detail_tool(),
                 self._build_find_items_tool(),
+                self._build_edit_items_tool(),
                 self._build_compress_nodes_tool(),
                 self._build_delete_nodes_tool(),
-                self._build_edit_items_tool(),
                 self._build_delete_item_tool(),
                 self._build_replace_item_tool(),
                 self._build_compress_item_tool(),
+                self._build_confirm_working_snapshot_tool(),
                 self._build_set_revision_summary_tool(),
             ]
         }
@@ -4817,12 +4950,6 @@ class ContextWorkbenchToolRegistry:
     def tool_catalog(cls) -> list[dict[str, str]]:
         return [
             {
-                "id": "preview_context_selection",
-                "label": "Preview Selection",
-                "description": "Inspect the current overview for specific nodes or the whole snapshot.",
-                "status": "available",
-            },
-            {
                 "id": "get_context_node_details",
                 "label": "Node Details",
                 "description": "Expand one or more nodes into full blocks and provider items before editing them.",
@@ -4831,13 +4958,19 @@ class ContextWorkbenchToolRegistry:
             {
                 "id": "find_context_items",
                 "label": "Find Items",
-                "description": "Search provider items using lightweight metadata and previews, without returning full node content.",
+                "description": "Find provider items by node, item, type, role, text, or tool filters.",
+                "status": "available",
+            },
+            {
+                "id": "edit_context_items",
+                "label": "Edit Items",
+                "description": "Batch delete, replace, or compress provider items selected by filters.",
                 "status": "available",
             },
             {
                 "id": "compress_context_nodes",
                 "label": "Compress Nodes",
-                "description": "Whole-node compression: replace nodes, discussions, topics, or assistant turns with summary nodes, removing text, reasoning, tool calls, and tool outputs.",
+                "description": "Replace nodes with a summary node; assistant nodes must be expanded before compression.",
                 "status": "available",
             },
             {
@@ -4847,15 +4980,9 @@ class ContextWorkbenchToolRegistry:
                 "status": "available",
             },
             {
-                "id": "edit_context_items",
-                "label": "Edit Items",
-                "description": "Batch delete, replace, or compress provider item content selected by node/item/type filters.",
-                "status": "available",
-            },
-            {
                 "id": "delete_context_item",
                 "label": "Delete Item",
-                "description": "Delete one or more items inside a single node; tool pairs are removed atomically.",
+                "description": "Delete one or more items inside a single node from the current working snapshot.",
                 "status": "available",
             },
             {
@@ -4868,6 +4995,18 @@ class ContextWorkbenchToolRegistry:
                 "id": "compress_context_item",
                 "label": "Compress Item",
                 "description": "Replace one item with a shorter version while keeping the same item type.",
+                "status": "available",
+            },
+            {
+                "id": "confirm_working_snapshot",
+                "label": "Confirm Working Snapshot",
+                "description": "Confirm the final overview of every active node after all intended edits are complete.",
+                "status": "available",
+            },
+            {
+                "id": "set_context_revision_summary",
+                "label": "Set Revision Summary",
+                "description": "Set the human-readable summary for the restore history entry after edits.",
                 "status": "available",
             },
         ]
@@ -4904,15 +5043,16 @@ class ContextWorkbenchToolRegistry:
         requires_single_node: bool = False,
         should_expand_details: bool = False,
     ) -> ToolExecution:
+        del target_hint
         payload = {
             "payload_kind": "target_resolution",
             "resolved": False,
             "action": action_name,
             "message": message,
-            "target_hint": sanitize_text(target_hint).strip(),
             "requires_single_node": requires_single_node,
             "should_expand_details": should_expand_details,
-            "candidates": sanitize_value(candidates or self.draft.suggest_target_nodes(target_hint)),
+            "selected_node_numbers": list(self.draft.selected_node_numbers),
+            "candidates": sanitize_value(candidates or []),
         }
         return ToolExecution(
             output_text=json.dumps(payload, ensure_ascii=False),
@@ -4944,57 +5084,6 @@ class ContextWorkbenchToolRegistry:
             status="needs_input",
         )
 
-    def _build_preview_selection_tool(self) -> ContextWorkbenchToolDefinition:
-        def handler(arguments: dict[str, Any]) -> ToolExecution:
-            nodes = self.draft.resolve_target_nodes(arguments, allow_all_active=True)
-            items = self.draft.overview_items(nodes)
-            preview_lines = [
-                f"- {sanitize_text(item.get('label') or '').strip() or 'Node'} | "
-                f"{sanitize_text(item.get('role') or '').strip() or 'unknown'} | "
-                f"{format_token_count(int(item.get('token_estimate') or 0))} tokens | "
-                f"tool {format_token_count(int(item.get('tool_token_estimate') or 0))} tokens | "
-                f"{format_tool_usage(sanitize_value(item.get('tool_usage')))} | "
-                f"{sanitize_text(item.get('preview') or '').strip() or '[empty]'}"
-                for item in items
-            ]
-            return ToolExecution(
-                output_text=json.dumps(
-                    {
-                        "payload_kind": "node_overview_list",
-                        "selected_node_numbers": list(self.draft.selected_node_numbers),
-                        "items": items,
-                    },
-                    ensure_ascii=False,
-                ),
-                display_title="Preview Selection",
-                display_detail="Inspect the current snapshot overview",
-                display_result="\n".join(preview_lines) or "No active nodes are available.",
-            )
-
-        return ContextWorkbenchToolDefinition(
-            name="preview_context_selection",
-            label="Preview Selection",
-            description="Inspect the current overview for specific nodes or the whole snapshot.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "node_numbers": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "Optional 1-based Node # values from the current snapshot.",
-                    },
-                    "target_hint": {
-                        "type": "string",
-                        "description": "Optional natural-language target hint when no Node # is specified.",
-                    }
-                },
-                "required": [],
-                "additionalProperties": False,
-            },
-            status="available",
-            handler=handler,
-        )
-
     def _mark_detail_nodes_returned(self, nodes: list[ContextWorkbenchDraftNode]) -> None:
         for node in nodes:
             if node.source_node_number is not None:
@@ -5019,14 +5108,55 @@ class ContextWorkbenchToolRegistry:
     def _invalidate_detail_cache(self) -> None:
         self._returned_detail_node_numbers.clear()
 
+    def _nodes_missing_required_details(
+        self,
+        nodes: list[ContextWorkbenchDraftNode],
+    ) -> list[ContextWorkbenchDraftNode]:
+        missing_nodes: list[ContextWorkbenchDraftNode] = []
+        for node in nodes:
+            node_number = node.source_node_number
+            if node_number is None or node_number in self._returned_detail_node_numbers:
+                continue
+
+            overview = self.draft.compact_overview_for_node(node)
+            role = sanitize_text(overview.get("role") or "").strip()
+            if role == "assistant":
+                missing_nodes.append(node)
+
+        return missing_nodes
+
+    def _required_detail_execution(
+        self,
+        *,
+        action_name: str,
+        nodes: list[ContextWorkbenchDraftNode],
+        reason: str,
+    ) -> ToolExecution:
+        missing_numbers = [
+            node.source_node_number
+            for node in nodes
+            if node.source_node_number is not None
+        ]
+        missing_label = format_node_ranges(missing_numbers)
+        message = (
+            f"{action_name} cannot proceed from assistant previews alone. "
+            f"Call get_context_node_details for Node #{missing_label} first, then retry with a summary based on the returned full details. "
+            f"{reason}"
+        ).strip()
+        return self._target_resolution_execution(
+            action_name=action_name,
+            message=message,
+            candidates=self.draft.overview_items(nodes),
+            should_expand_details=True,
+        )
+
     def _build_node_detail_tool(self) -> ContextWorkbenchToolDefinition:
         def handler(arguments: dict[str, Any]) -> ToolExecution:
             nodes = self.draft.resolve_target_nodes(arguments)
             if not nodes:
                 return self._target_resolution_execution(
                     action_name="get_context_node_details",
-                    message="I could not resolve a target node. Mention Node #, keep a node selected, or use target_hint.",
-                    target_hint=sanitize_text(arguments.get("target_hint") or ""),
+                    message="get_context_node_details requires explicit node_numbers from the current snapshot.",
                     should_expand_details=True,
                 )
 
@@ -5078,14 +5208,10 @@ class ContextWorkbenchToolRegistry:
                     "node_numbers": {
                         "type": "array",
                         "items": {"type": "integer"},
-                        "description": "Optional 1-based Node # values from the current snapshot.",
+                        "description": "Required 1-based Node # values from the current snapshot.",
                     },
-                    "target_hint": {
-                        "type": "string",
-                        "description": "Optional natural-language target hint when no Node # is specified.",
-                    }
                 },
-                "required": [],
+                "required": ["node_numbers"],
                 "additionalProperties": False,
             },
             status="available",
@@ -5274,8 +5400,7 @@ class ContextWorkbenchToolRegistry:
             if not nodes:
                 return self._target_resolution_execution(
                     action_name="delete_context_item",
-                    message="I could not resolve which node should lose this item. Mention Node #, keep one node selected, or use target_hint.",
-                    target_hint=sanitize_text(arguments.get("target_hint") or ""),
+                    message="delete_context_item requires exactly one explicit node_numbers value from the current snapshot.",
                     requires_single_node=True,
                     should_expand_details=True,
                 )
@@ -5283,7 +5408,6 @@ class ContextWorkbenchToolRegistry:
                 return self._target_resolution_execution(
                     action_name="delete_context_item",
                     message="delete_context_item needs exactly one target node. Narrow it to a single Node # first.",
-                    target_hint=sanitize_text(arguments.get("target_hint") or ""),
                     candidates=self.draft.overview_items(nodes),
                     requires_single_node=True,
                     should_expand_details=True,
@@ -5345,11 +5469,7 @@ class ContextWorkbenchToolRegistry:
                     "node_numbers": {
                         "type": "array",
                         "items": {"type": "integer"},
-                        "description": "Optional single 1-based Node # value from the current snapshot.",
-                    },
-                    "target_hint": {
-                        "type": "string",
-                        "description": "Optional natural-language target hint when no Node # is specified.",
+                        "description": "Required single 1-based Node # value from the current snapshot.",
                     },
                     "item_number": {
                         "type": "integer",
@@ -5365,7 +5485,7 @@ class ContextWorkbenchToolRegistry:
                         "description": "Optional reason for deleting this item.",
                     },
                 },
-                "required": [],
+                "required": ["node_numbers"],
                 "additionalProperties": False,
             },
             status="available",
@@ -5453,8 +5573,7 @@ class ContextWorkbenchToolRegistry:
             if not nodes:
                 return self._target_resolution_execution(
                     action_name="replace_context_item",
-                    message="I could not resolve which node should receive the replacement item. Mention Node #, keep one node selected, or use target_hint.",
-                    target_hint=sanitize_text(arguments.get("target_hint") or ""),
+                    message="replace_context_item requires exactly one explicit node_numbers value from the current snapshot.",
                     requires_single_node=True,
                     should_expand_details=True,
                 )
@@ -5462,7 +5581,6 @@ class ContextWorkbenchToolRegistry:
                 return self._target_resolution_execution(
                     action_name="replace_context_item",
                     message="replace_context_item needs exactly one target node. Narrow it to a single Node # first.",
-                    target_hint=sanitize_text(arguments.get("target_hint") or ""),
                     candidates=self.draft.overview_items(nodes),
                     requires_single_node=True,
                     should_expand_details=True,
@@ -5506,11 +5624,7 @@ class ContextWorkbenchToolRegistry:
                     "node_numbers": {
                         "type": "array",
                         "items": {"type": "integer"},
-                        "description": "Optional single 1-based Node # value from the current snapshot.",
-                    },
-                    "target_hint": {
-                        "type": "string",
-                        "description": "Optional natural-language target hint when no Node # is specified.",
+                        "description": "Required single 1-based Node # value from the current snapshot.",
                     },
                     "item_number": {
                         "type": "integer",
@@ -5522,7 +5636,7 @@ class ContextWorkbenchToolRegistry:
                         "description": "Optional reason for replacing this item.",
                     },
                 },
-                "required": ["item_number", "replacement_item"],
+                "required": ["node_numbers", "item_number", "replacement_item"],
                 "additionalProperties": False,
             },
             status="available",
@@ -5536,8 +5650,7 @@ class ContextWorkbenchToolRegistry:
             if not nodes:
                 return self._target_resolution_execution(
                     action_name="compress_context_item",
-                    message="I could not resolve which node contains the item to compress. Mention Node #, keep one node selected, or use target_hint.",
-                    target_hint=sanitize_text(arguments.get("target_hint") or ""),
+                    message="compress_context_item requires exactly one explicit node_numbers value from the current snapshot.",
                     requires_single_node=True,
                     should_expand_details=True,
                 )
@@ -5545,7 +5658,6 @@ class ContextWorkbenchToolRegistry:
                 return self._target_resolution_execution(
                     action_name="compress_context_item",
                     message="compress_context_item needs exactly one target node. Narrow it to a single Node # first.",
-                    target_hint=sanitize_text(arguments.get("target_hint") or ""),
                     candidates=self.draft.overview_items(nodes),
                     requires_single_node=True,
                     should_expand_details=True,
@@ -5581,11 +5693,7 @@ class ContextWorkbenchToolRegistry:
                     "node_numbers": {
                         "type": "array",
                         "items": {"type": "integer"},
-                        "description": "Optional single 1-based Node # value from the current snapshot.",
-                    },
-                    "target_hint": {
-                        "type": "string",
-                        "description": "Optional natural-language target hint when no Node # is specified.",
+                        "description": "Required single 1-based Node # value from the current snapshot.",
                     },
                     "item_number": {
                         "type": "integer",
@@ -5600,7 +5708,7 @@ class ContextWorkbenchToolRegistry:
                         "description": "Optional note about the compression style.",
                     },
                 },
-                "required": ["item_number", "compressed_content"],
+                "required": ["node_numbers", "item_number", "compressed_content"],
                 "additionalProperties": False,
             },
             status="available",
@@ -5613,8 +5721,15 @@ class ContextWorkbenchToolRegistry:
             if not nodes:
                 return self._target_resolution_execution(
                     action_name="compress_context_nodes",
-                    message="I could not resolve which nodes should be compressed. Mention Node #, keep nodes selected, or use target_hint.",
-                    target_hint=sanitize_text(arguments.get("target_hint") or ""),
+                    message="compress_context_nodes requires explicit node_numbers from the current snapshot.",
+                )
+
+            missing_detail_nodes = self._nodes_missing_required_details(nodes)
+            if missing_detail_nodes:
+                return self._required_detail_execution(
+                    action_name="compress_context_nodes",
+                    nodes=missing_detail_nodes,
+                    reason="Assistant nodes are only shown as one-sentence previews in the snapshot.",
                 )
 
             result = self.draft.compress_nodes(
@@ -5635,9 +5750,8 @@ class ContextWorkbenchToolRegistry:
             name="compress_context_nodes",
             label="Compress Nodes",
             description=(
-                "Whole-node compression. Replace one or more nodes with a new summary node inside the current working snapshot. "
-                "Use this when the user asks to compress a node, discussion, topic, or assistant turn; it removes the target nodes' "
-                "assistant text, reasoning, tool calls, and tool outputs from the snapshot."
+                "Replace one or more nodes with a new summary node inside the current working snapshot. "
+                "Existing assistant nodes must be expanded with get_context_node_details first because the snapshot only includes their preview."
             ),
             parameters={
                 "type": "object",
@@ -5645,11 +5759,7 @@ class ContextWorkbenchToolRegistry:
                     "node_numbers": {
                         "type": "array",
                         "items": {"type": "integer"},
-                        "description": "Optional 1-based Node # values from the current snapshot.",
-                    },
-                    "target_hint": {
-                        "type": "string",
-                        "description": "Optional natural-language target hint when no Node # is specified.",
+                        "description": "Required 1-based Node # values from the current snapshot.",
                     },
                     "summary_markdown": {
                         "type": "string",
@@ -5664,7 +5774,7 @@ class ContextWorkbenchToolRegistry:
                         "description": "Short note about the compression style.",
                     },
                 },
-                "required": ["summary_markdown"],
+                "required": ["node_numbers", "summary_markdown"],
                 "additionalProperties": False,
             },
             status="available",
@@ -5677,8 +5787,7 @@ class ContextWorkbenchToolRegistry:
             if not nodes:
                 return self._target_resolution_execution(
                     action_name="delete_context_nodes",
-                    message="I could not resolve which nodes should be deleted. Mention Node #, keep nodes selected, or use target_hint.",
-                    target_hint=sanitize_text(arguments.get("target_hint") or ""),
+                    message="delete_context_nodes requires explicit node_numbers from the current snapshot.",
                 )
 
             result = self.draft.delete_nodes(
@@ -5703,17 +5812,43 @@ class ContextWorkbenchToolRegistry:
                     "node_numbers": {
                         "type": "array",
                         "items": {"type": "integer"},
-                        "description": "Optional 1-based Node # values from the current snapshot.",
-                    },
-                    "target_hint": {
-                        "type": "string",
-                        "description": "Optional natural-language target hint when no Node # is specified.",
+                        "description": "Required 1-based Node # values from the current snapshot.",
                     },
                     "reason": {
                         "type": "string",
                         "description": "Optional reason for deleting these nodes.",
                     },
                 },
+                "required": ["node_numbers"],
+                "additionalProperties": False,
+            },
+            status="available",
+            handler=handler,
+        )
+
+    def _build_confirm_working_snapshot_tool(self) -> ContextWorkbenchToolDefinition:
+        def handler(_arguments: dict[str, Any]) -> ToolExecution:
+            result = self.draft.final_snapshot_payload()
+            active_count = int(result.get("active_node_count") or 0)
+            inactive_count = int(result.get("inactive_node_count") or 0)
+            total_tokens = int(result.get("total_token_estimate") or 0)
+            return ToolExecution(
+                output_text=json.dumps(result, ensure_ascii=False),
+                display_title="Confirm Working Snapshot",
+                display_detail=f"{active_count} active nodes, {inactive_count} inactive nodes",
+                display_result=(
+                    f"Confirmed final working snapshot: {active_count} active nodes, "
+                    f"{inactive_count} inactive nodes, about {format_token_count(total_tokens)} tokens."
+                ),
+            )
+
+        return ContextWorkbenchToolDefinition(
+            name="confirm_working_snapshot",
+            label="Confirm Working Snapshot",
+            description="Confirm the final overview of every active node after all intended edits are complete. Use once near the end of a turn, not after every edit.",
+            parameters={
+                "type": "object",
+                "properties": {},
                 "required": [],
                 "additionalProperties": False,
             },
@@ -5874,18 +6009,6 @@ def build_context_chat_runtime(
 
     context_input: list[dict[str, Any]] = []
 
-    context_input.append(
-        SimpleAgent._message(
-            "developer",
-            "\n\n".join(
-                [
-                    "这里是主 Codex 对话的当前上下文快照。本轮回答和编辑都以这份快照为准；后面的右侧手动页历史可能提到旧节点或旧内容。",
-                    snapshot,
-                ]
-            ),
-        )
-    )
-
     for item in history:
         context_input.append(
             SimpleAgent._message(
@@ -5896,47 +6019,90 @@ def build_context_chat_runtime(
 
     context_input.append(
         SimpleAgent._message(
-            "user",
+            "developer",
             "\n\n".join(
                 [
-                    "CURRENT WORKBENCH USER MESSAGE:",
-                    sanitize_text(message),
+                    "这里是主 Codex 对话的当前上下文快照。本轮回答和编辑都以这份快照为准；前面的右侧手动页历史可能提到旧节点或旧内容。",
+                    snapshot,
                 ]
             ),
         )
     )
 
+    context_input.append(
+        SimpleAgent._message(
+            "user",
+            sanitize_text(message),
+        )
+    )
+
     request_model = sanitize_text(
         session.agent.settings.context_workbench_model or session.agent.settings.model
-    ).strip() or "gpt-5.4-mini"
+    ).strip() or "gpt-5.5"
     instructions = "\n".join(
         [
-            "你在右侧手动页里工作，这里是一个独立聊天窗口。",
-            "默认先像正常聊天助手一样回应用户当前这句话，不要先背职责，不要先讲工具。",
-            "你只处理当前上下文，不继续用户的主聊天任务。",
-            "如果用户只是打招呼、测试你能不能正常聊天、或者问这里怎么用，直接正常回答，不要调用工具。",
-            "只有在定位、核实、修改上下文时，才需要调用工具。",
-            "主 Codex 上下文快照位于 input[0] 的 developer 消息里；这一轮里所有 Node # 都只以 input[0] 的当前快照为准。",
-            "右侧手动页历史只是你和用户的连续对话记录，里面提到的节点数、Node #、内容摘要可能已经过期；回答当前上下文、定位节点、执行编辑时必须以本轮最新快照为准。",
-            "分析类问题如果能靠全局概览直接回答，就先直接回答。",
-            "用户问“你现在看到什么上下文 / 是摘要还是原文 / 有哪些节点”时，只根据当前快照的可见层回答，不要为了这种问题调用 get_context_node_details。",
-            "user 节点直接给全文；assistant 节点默认只给上下文地图折叠态同款首句预览，预览后面的内容你并不可见；需要协议层细节或完整内容时，再调用 get_context_node_details。",
-            "Node Detail 里会给出 item #1 / item #2 / item #3 这样的当轮可编辑 item 视图。",
-            "如果你要定位某类 item（例如所有 tool output、某类 tool call、某个文本片段），优先调用 find_context_items；它只返回预览和元数据，不会把大段内容塞进你的上下文。",
-            "用户说压缩某个节点、某段讨论、某个主题或某轮 assistant 内容时，默认是节点级压缩：优先调用 compress_context_nodes，用一个摘要节点替换整个目标节点，包含其中的 assistant 文本、reasoning、工具调用和工具输出。",
-            "不要把节点级压缩误做成只压缩 message item；如果目标节点里有工具输出，压缩整个节点通常就是为了移除这些大块工具输出。",
-            "如果你要批量删除、改写、压缩 assistant text / tool call / tool output，优先调用 edit_context_items，用 selector 一次选中目标，再用 operation 一次完成；不要逐个 item 反复调用单项工具。",
-            "edit_context_items 只用于 item 级编辑：例如用户明确要求只压缩所有 tool output、只删除工具调用、或保留节点结构但缩短某类 item。",
-            "edit_context_items 的 replace_content / compress_content 会保留原 item 的 type 和 call_id，只改可编辑内容；delete 会原子删除工具调用/输出配对，保证 Codex 输入仍然合法。",
-            "delete_context_item / replace_context_item / compress_context_item 只用于少数精细单点修改，或者当用户明确要求按完整 provider item 改写时使用。",
-            "选中只是强提示，不是门槛。显式 node_numbers 优先，其次是当前选中；如果都没有，可以用 target_hint 让系统帮你定位候选节点。",
-            "当你调用 mutation tool 时，你是在改 working snapshot，UI 会在这一轮结束后统一提交。",
-            "简单删除、替换、压缩完成后，不要为了确认结果再次展开节点详情；直接依据工具返回和 working_overview 继续或收尾。只有下一步编辑确实需要修改后的完整 provider_items 时，才再次调用 get_context_node_details。",
-            "如果这一轮做过任何编辑，在所有 mutation 都完成后，再调用一次 set_context_revision_summary，用 1 到 2 句话概括这次具体改了什么；这句会显示在恢复页。注意：总结必须说明修改了【什么具体的上下文内容】（例如“压缩了所有工具输出”或“压缩了关于计划讨论的部分”），绝对不要简单说“修改了节点”等废话。",
-            "如果工具返回了 working_overview，就把它当成这一轮最新的上下文状态。",
-            "如果工具返回 target_resolution 或 item_resolution，不要硬猜；先根据候选或详情重新定位，再继续。",
-            "这一轮结束前，你必须给用户一个明确的答复（语言与用户沟通语言一致），不能只停在工具调用上。",
-            "回答保持简洁、具体，说人话，可以使用 Markdown。",
+            "你是主 Codex 对话的上下文维护助手，运行在右侧手动页中。",
+            "",
+            "你的目标是维护、查看、压缩、删除或改写当前主 Codex 上下文。",
+            "不要搞混你自己的右侧手动页聊天历史和主 Codex 的聊天历史。",
+            "不要继续进行主 Codex 的任务；用户让你处理的是“当前主 Codex 上下文”。",
+            "",
+            "你会看到一条最新的 developer 消息，标题为：",
+            "# 当前主 Codex 上下文快照",
+            "",
+            "这份快照是本轮唯一可信的主 Codex 上下文来源。",
+            "右侧手动页历史只是你和用户关于上下文维护的对话，可能提到旧节点、旧内容或旧选择；定位节点、回答当前上下文、执行编辑时，都以最新快照为准。",
+            "",
+            "快照中的 Node # 只在当前这份快照中有效。",
+            "user 节点通常在快照里给全文。",
+            "assistant 节点通常只给首句预览；预览后面的内容你不可见。",
+            "如果任务需要理解、压缩或精确修改 assistant 节点的完整内容，先调用 get_context_node_details。",
+            "",
+            "工具能力：",
+            "",
+            "- get_context_node_details(node_numbers)",
+            "  展开一个或多个节点的完整详情。",
+            "  返回 node_detail_list，包括节点 text、blocks、provider_items，以及可编辑的 item # 视图。",
+            "  用于读取 assistant 节点全文、工具调用、工具输出，或准备做精细 item 级编辑。",
+            "",
+            "- compress_context_nodes(node_numbers, summary_markdown, title?, style?)",
+            "  用一个摘要节点替换一个或多个完整节点。",
+            "  返回 mutation_delta，只描述本次变化，不会重复返回完整快照。",
+            "  适合压缩一段讨论、一个主题、一个范围内的节点，或包含工具输出的大 assistant 节点。",
+            "",
+            "- delete_context_nodes(node_numbers, reason?)",
+            "  删除一个或多个完整节点。",
+            "  返回 mutation_delta。",
+            "  删除通常不需要先展开详情，除非用户要求你先核实内容。",
+            "",
+            "- delete_context_item(node_numbers, item_number / item_numbers, reason?)",
+            "- replace_context_item(node_numbers, item_number, replacement_item, reason?)",
+            "- compress_context_item(node_numbers, item_number, compressed_content, style?)",
+            "  这些是精细 item 级编辑工具。",
+            "  只在用户明确要求处理某个 provider item、某段 assistant 文本、某个工具调用或某个工具输出时使用。",
+            "  一般先 get_context_node_details，确认 item # 后再调用。",
+            "  默认不要把模糊的压缩/删除请求理解成 item 级编辑。",
+            "",
+            "- confirm_working_snapshot()",
+            "  所有计划内编辑完成后，用它确认最终 working snapshot。",
+            "  返回 final_working_snapshot。",
+            "",
+            "- set_context_revision_summary(summary)",
+            "  编辑完成并确认后，保存一句恢复页可读的变更摘要。",
+            "  摘要要说明改了什么具体上下文内容，不要只说“修改了节点”。",
+            "",
+            "推荐工作方式：",
+            "",
+            "- 用户只是问“现在看到什么 / 有哪些节点 / 选中了什么”：优先基于快照直接回答，不必展开详情。",
+            "- 用户说“删除 3-50”“删掉节点 3 到 50”：把它理解为 Node #3 到 Node #50 的范围，通常直接 delete_context_nodes。",
+            "- 用户说“压缩 3-50”“压缩这些节点”：把它理解为节点级压缩；如果范围内包含 assistant 节点，先 get_context_node_details，再 compress_context_nodes。",
+            "- 用户说“压缩有关前端的讨论”“删掉关于某主题的部分”：先根据快照定位相关节点；能判断就直接处理，范围不明确才简短确认。",
+            "- 用户说“压缩这个 assistant 节点”“压缩工具输出很多的那轮”：先 get_context_node_details，再基于完整内容写 summary_markdown。",
+            "- 用户说“只删某个工具输出 / 改某个工具调用 / 保留节点但缩短某个 item”：走 item 级工具。",
+            "- 模糊请求默认按节点级或主题级的大方向处理，不要过早拆到 provider item。",
+            "- 选择最少、最直接的工具路径。不要重复展开同一个节点，不要反复确认显而易见的范围，不要啰嗦解释内部流程。",
+            "- 如果工具返回 target_resolution 或 item_resolution，说明目标不明确；根据返回信息重新明确 node_numbers 或 item #，必要时再问用户。",
+            "- 只要本轮做过编辑，结束前先 confirm_working_snapshot，再 set_context_revision_summary，最后用用户的语言简短说明结果。",
         ]
     )
     return instructions, request_model, draft, tool_registry, context_input
@@ -6192,6 +6358,16 @@ def parse_context_proxy_sse_event(
         raise RuntimeError(f"response stream error: {message or 'unknown error'}")
 
 
+def context_workbench_prompt_cache_key(session_id: str) -> str:
+    safe_session_id = "".join(
+        ch if ch.isalnum() or ch in "-_." else "-"
+        for ch in sanitize_text(session_id).strip()
+    ).strip("-_.")
+    if not safe_session_id:
+        return "hash-context-workbench"
+    return f"hash-context:{safe_session_id[:48]}"
+
+
 def stream_context_codex_proxy_response(
     request: dict[str, Any],
     *,
@@ -6355,7 +6531,7 @@ def run_context_chat_turn(
     context_agent = build_context_workbench_agent(session.agent.settings, context_provider_id)
     tool_events: list[ToolEvent] = []
     readonly_tool_result_cache: dict[str, str] = {}
-    readonly_tool_cache_names = {"preview_context_selection", "get_context_node_details"}
+    readonly_tool_cache_names = {"get_context_node_details", "confirm_working_snapshot"}
 
     round_count = 0
     while True:
@@ -6371,8 +6547,10 @@ def run_context_chat_turn(
                 "input": sanitize_value(context_input),
                 "tools": tool_registry.schemas,
                 "store": False,
+                "prompt_cache_key": context_workbench_prompt_cache_key(session.session_id),
                 "extra_headers": {
                     "x-hash-context-internal": "context-workbench",
+                    "x-hash-context-session-id": session.session_id,
                 },
             }
             if request_reasoning_effort:
@@ -6761,7 +6939,7 @@ def attachment_inputs_from_records(attachments: list[dict[str, object]]) -> list
 
 
 def model_options(default_model: str, configured_models: list[str] | None = None) -> list[str]:
-    ordered = [default_model, *(configured_models or []), "gpt-5.4", "gpt-5.4-mini", "gpt-5.2"]
+    ordered = [default_model, *(configured_models or []), "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.2"]
     unique_models: list[str] = []
     for model in ordered:
         safe_model = sanitize_text(model).strip()
@@ -6982,6 +7160,9 @@ def context_workbench_provider_payloads(settings: Settings, *, refresh_codex_pro
         if provider_id != CODEX_PROXY_PROVIDER_ID:
             continue
         provider["api_base_url"] = CODEX_PROXY_BASE_URL
+        context_model = sanitize_text(settings.context_workbench_model or "").strip()
+        if context_model:
+            provider["default_model"] = context_model
         if not refresh_codex_proxy_models:
             continue
         try:
@@ -6995,6 +7176,20 @@ def context_workbench_provider_payloads(settings: Settings, *, refresh_codex_pro
             provider["last_sync_error"] = "" if provider.get("models") else sanitize_text(str(exc))
             continue
         if fetched_models:
+            if context_model and not any(
+                sanitize_text(item.get("id") or "").strip() == context_model
+                for item in fetched_models
+                if isinstance(item, dict)
+            ):
+                fetched_models = [
+                    {
+                        "id": context_model,
+                        "label": context_model,
+                        "group": "Codex",
+                        "provider": "Codex",
+                    },
+                    *fetched_models,
+                ]
             provider["models"] = fetched_models
             provider["last_sync_error"] = ""
             provider["last_sync_at"] = datetime.now(timezone.utc).isoformat()
@@ -7142,6 +7337,39 @@ def safe_sync_proxy_session_override_if_known(
         }
 
 
+def refresh_session_from_proxy_active_context_if_known(
+    app_state: AppState,
+    session: SessionState,
+) -> SessionState:
+    session_id = sanitize_text(session.session_id or "").strip()
+    if not session_id:
+        return session
+
+    try:
+        proxy_payload = get_codex_proxy_control_json(
+            f"/api/proxy/sessions/{quote(session_id, safe='')}",
+            timeout_seconds=2,
+        )
+    except ValueError:
+        return session
+
+    if not proxy_payload:
+        return session
+
+    active_transcript = normalize_transcript(
+        proxy_payload.get("active_transcript") or proxy_payload.get("transcript")
+    )
+    if not active_transcript:
+        return session
+
+    return app_state.upsert_proxy_session(
+        session_id=session_id,
+        title=sanitize_text(proxy_payload.get("title") or "").strip() or session.title,
+        transcript=active_transcript,
+        is_running=bool(proxy_payload.get("is_running")),
+    )
+
+
 def append_proxy_override_warning(answer: str, error_message: str) -> str:
     warning = (
         "注意：这次上下文编辑已经写入本地视图，但同步到 Codex 代理 override 失败："
@@ -7186,7 +7414,19 @@ class HashHTTPRequestHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/init":
-            self._send_json(self.app_state.bootstrap_payload())
+            query = parse_qs(parsed.query)
+            session_id = sanitize_text((query.get("session_id") or [""])[0]).strip()
+            include_conversation = sanitize_text((query.get("include_conversation") or ["1"])[0]).strip() not in {
+                "0",
+                "false",
+                "no",
+            }
+            self._send_json(
+                self.app_state.bootstrap_payload(
+                    session_id=session_id,
+                    include_conversation=include_conversation,
+                )
+            )
             return
 
         if parsed.path == "/api/settings":
@@ -7199,7 +7439,17 @@ class HashHTTPRequestHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/context-workbench-settings":
-            provider_payloads = context_workbench_provider_payloads(self.app_state.settings)
+            query = parse_qs(parsed.query)
+            refresh_models = sanitize_text((query.get("refresh_models") or ["0"])[0]).strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            provider_payloads = context_workbench_provider_payloads(
+                self.app_state.settings,
+                refresh_codex_proxy_models=refresh_models,
+            )
             self._send_json(
                 {
                     "settings": context_workbench_settings_payload(self.app_state.settings),
@@ -7208,6 +7458,31 @@ class HashHTTPRequestHandler(BaseHTTPRequestHandler):
                     "tool_catalog": ContextWorkbenchToolRegistry.tool_catalog(),
                 }
             )
+            return
+
+        if parsed.path == "/api/proxy/sessions":
+            proxy_payload = get_codex_proxy_control_json("/api/proxy/sessions")
+            self._send_json(proxy_payload or {"active_session_id": "", "sessions": []})
+            return
+
+        if parsed.path == "/api/proxy/usage":
+            proxy_payload = get_codex_proxy_control_json("/api/proxy/usage")
+            self._send_json(proxy_payload or {"overall": {}, "sessions": {}})
+            return
+
+        if parsed.path.startswith("/api/proxy/sessions/") and parsed.path.endswith("/usage"):
+            session_id = quote(parsed.path.split("/api/proxy/sessions/", 1)[1].rsplit("/", 1)[0], safe="")
+            proxy_payload = get_codex_proxy_control_json(f"/api/proxy/sessions/{session_id}/usage")
+            self._send_json(proxy_payload or {"summary": {}})
+            return
+
+        if parsed.path.startswith("/api/proxy/sessions/"):
+            session_id = quote(parsed.path.split("/api/proxy/sessions/", 1)[1].split("/", 1)[0], safe="")
+            proxy_payload = get_codex_proxy_control_json(f"/api/proxy/sessions/{session_id}")
+            if proxy_payload is None:
+                self._send_json({"error": "session not found"}, status=HTTPStatus.NOT_FOUND)
+                return
+            self._send_json(proxy_payload)
             return
 
         if parsed.path == "/api/workspace":
@@ -7330,6 +7605,15 @@ class HashHTTPRequestHandler(BaseHTTPRequestHandler):
                 session_id = sanitize_text(payload.get("session_id") or "").strip()
                 if not session_id:
                     raise ValueError("session_id is required")
+                if codex_proxy_session_exists(session_id):
+                    self._send_json(
+                        {
+                            "status": "skipped",
+                            "reason": "proxy_session_exists",
+                            "session_id": session_id,
+                        }
+                    )
+                    return
                 transcript = codex_local_session_transcript(session_id)
                 if not transcript or not transcript_has_conversation_records(transcript):
                     self._send_json(
@@ -7618,7 +7902,10 @@ class HashHTTPRequestHandler(BaseHTTPRequestHandler):
                     user_locale=payload.get("user_locale") if isinstance(payload.get("user_locale"), str) else None,
                 )
                 self.app_state.settings = updated_settings
-                provider_payloads = context_workbench_provider_payloads(updated_settings)
+                provider_payloads = context_workbench_provider_payloads(
+                    updated_settings,
+                    refresh_codex_proxy_models=True,
+                )
                 self._send_json(
                     {
                         "settings": context_workbench_settings_payload(updated_settings),
@@ -7674,8 +7961,20 @@ class HashHTTPRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(proxy_payload)
                 return
 
+            if parsed.path == "/api/proxy-session-usage-reset":
+                session_id = sanitize_text(payload.get("session_id") or "").strip()
+                if not session_id:
+                    raise ValueError("session_id is required")
+                proxy_payload = post_codex_proxy_control_json(
+                    f"/api/proxy/sessions/{quote(session_id, safe='')}/usage/reset",
+                    {},
+                )
+                self._send_json(proxy_payload)
+                return
+
             if parsed.path == "/api/context-workbench-suggestions":
                 session = self.app_state.get_session(payload.get("session_id"))
+                session = refresh_session_from_proxy_active_context_if_known(self.app_state, session)
                 self._send_json(context_workbench_suggestions_payload(session))
                 return
 
@@ -7713,6 +8012,7 @@ class HashHTTPRequestHandler(BaseHTTPRequestHandler):
 
             if parsed.path == "/api/context-chat":
                 session = self.app_state.get_session(payload.get("session_id"))
+                session = refresh_session_from_proxy_active_context_if_known(self.app_state, session)
                 message = sanitize_text(payload.get("message", "")).strip()
                 if not message:
                     raise ValueError("message is required")
@@ -7748,6 +8048,7 @@ class HashHTTPRequestHandler(BaseHTTPRequestHandler):
 
             if parsed.path == "/api/context-chat-stream":
                 session = self.app_state.get_session(payload.get("session_id"))
+                session = refresh_session_from_proxy_active_context_if_known(self.app_state, session)
                 message = sanitize_text(payload.get("message", "")).strip()
                 if not message:
                     raise ValueError("message is required")
@@ -7802,6 +8103,8 @@ class HashHTTPRequestHandler(BaseHTTPRequestHandler):
                         check_cancelled=raise_if_cancelled,
                     )
                     raise_if_cancelled()
+                    if draft.has_changes:
+                        self._write_stream_event({"type": "finalizing", "stage": "commit", "has_changes": True})
                     payload_data = build_context_chat_response_payload(
                         self.app_state,
                         session,
@@ -7863,41 +8166,33 @@ class HashHTTPRequestHandler(BaseHTTPRequestHandler):
                 except (TypeError, ValueError) as exc:
                     raise ValueError("message_index must be a number") from exc
 
-                request_id = self.app_state.acquire_session_request(session, "context")
-                try:
-                    conversation, history, revisions, pending_restore = self.app_state.delete_context_workbench_history_message(
-                        session,
-                        message_index=message_index,
-                    )
-                    self._send_json(
-                        {
-                            "conversation": conversation,
-                            "history": history,
-                            "revisions": revisions,
-                            "pending_restore": pending_restore,
-                        }
-                    )
-                finally:
-                    self.app_state.release_session_request(session, "context", request_id)
+                conversation, history, revisions, pending_restore = self.app_state.delete_context_workbench_history_message(
+                    session,
+                    message_index=message_index,
+                )
+                self._send_json(
+                    {
+                        "conversation": conversation,
+                        "history": history,
+                        "revisions": revisions,
+                        "pending_restore": pending_restore,
+                    }
+                )
                 return
 
             if parsed.path == "/api/context-workbench-history-clear":
                 session = self.app_state.get_session(payload.get("session_id"))
-                request_id = self.app_state.acquire_session_request(session, "context")
-                try:
-                    conversation, history, revisions, pending_restore = self.app_state.clear_context_workbench_history(
-                        session,
-                    )
-                    self._send_json(
-                        {
-                            "conversation": conversation,
-                            "history": history,
-                            "revisions": revisions,
-                            "pending_restore": pending_restore,
-                        }
-                    )
-                finally:
-                    self.app_state.release_session_request(session, "context", request_id)
+                conversation, history, revisions, pending_restore = self.app_state.clear_context_workbench_history(
+                    session,
+                )
+                self._send_json(
+                    {
+                        "conversation": conversation,
+                        "history": history,
+                        "revisions": revisions,
+                        "pending_restore": pending_restore,
+                    }
+                )
                 return
 
             if parsed.path == "/api/context-undo-restore":

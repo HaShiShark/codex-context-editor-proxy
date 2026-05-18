@@ -455,8 +455,8 @@ function normalizeToolSettings(rawTools: unknown): ToolSetting[] {
 const DEFAULT_SETTINGS: OpenAISettings = {
   default_model: 'gpt-5.4-mini',
   default_reasoning_effort: 'default',
-  context_workbench_model: 'gpt-5.4-mini',
-  context_workbench_provider_id: 'openai',
+  context_workbench_model: 'gpt-5.5',
+  context_workbench_provider_id: 'codex-proxy',
   context_token_warning_threshold: 5000,
   context_token_critical_threshold: 10000,
   openai_base_url: '',
@@ -3338,11 +3338,13 @@ export default function App() {
               contextRevisionHistory={contextRevisionHistories[currentSessionId] || []}
               pendingContextRestore={pendingContextRestores[currentSessionId] || null}
               reasoningOptions={reasoningOptions}
+              proxyUsageSummary={null}
               uiLocale={uiLocale}
               onContextWorkbenchHistoryChange={handleContextWorkbenchHistoryChange}
               onContextWorkbenchConversationChange={handleContextWorkbenchConversationChange}
               onContextRevisionHistoryChange={handleContextRevisionHistoryChange}
               onPendingContextRestoreChange={handlePendingContextRestoreChange}
+              onProxyUsageSummaryChange={() => undefined}
               onEnsureSession={ensureSession}
               onUiLocaleChange={(locale) => applySettingsDraftPatch({ user_locale: locale })}
             />
@@ -3354,6 +3356,6 @@ export default function App() {
 }
 
 function model_options_fallback(defaultModel: string) {
-  const ordered = [defaultModel, 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.2'];
+  const ordered = [defaultModel, 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.2'];
   return Array.from(new Set(ordered.filter(Boolean)));
 }
