@@ -52,6 +52,7 @@ LOCAL_COMPACT_SUMMARY_PREFIX = (
     "Use this to build on the work that has already been done and avoid duplicating work. "
     "Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:"
 )
+LOCAL_COMPACT_USER_MESSAGE_MAX_TOKENS = 20_000
 MANUAL_LOCAL_COMPACT_PROMPT = """Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.
 This summary should be thorough in capturing technical details, code patterns, and architectural decisions that would be essential for continuing development work without losing context.
 
@@ -1429,8 +1430,18 @@ def replace_last_local_compact_prompt_input(input_items: Any, replacement_prompt
     return input_items
 
 
+def local_compact_approx_token_count(text: str) -> int:
+    return max(1, (len(str(text or "")) + 3) // 4)
+
+
+def truncate_text_to_approx_tokens(text: str, max_tokens: int) -> str:
+    if max_tokens <= 0:
+        return ""
+    return str(text or "")[: max_tokens * 4]
+
+
 def local_compacted_transcript(source_transcript: list[dict[str, Any]], assistant_summary_text: str) -> list[dict[str, Any]]:
-    retained: list[dict[str, Any]] = []
+    user_messages: list[str] = []
     for record in clean_transcript(source_transcript):
         if str(record.get("role") or "") != "user":
             continue
@@ -1442,8 +1453,27 @@ def local_compacted_transcript(source_transcript: list[dict[str, Any]], assistan
             or is_local_compact_summary_text(text)
         ):
             continue
-        retained.append(copy.deepcopy(record))
+        user_messages.append(text)
 
+    selected_messages: list[str] = []
+    remaining_tokens = LOCAL_COMPACT_USER_MESSAGE_MAX_TOKENS
+    for message in reversed(user_messages):
+        if remaining_tokens <= 0:
+            break
+        tokens = local_compact_approx_token_count(message)
+        if tokens <= remaining_tokens:
+            selected_messages.append(message)
+            remaining_tokens = max(0, remaining_tokens - tokens)
+        else:
+            selected_messages.append(truncate_text_to_approx_tokens(message, remaining_tokens))
+            break
+    selected_messages.reverse()
+
+    retained = [
+        transcript_record("user", message, [provider_message("user", message)])
+        for message in selected_messages
+        if message
+    ]
     summary_text = f"{LOCAL_COMPACT_SUMMARY_PREFIX}\n\n{assistant_summary_text or ''}"
     retained.append(transcript_record("user", summary_text, [provider_message("user", summary_text)]))
     return clean_transcript(retained)

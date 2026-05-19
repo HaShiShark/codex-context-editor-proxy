@@ -1950,6 +1950,44 @@ def test_local_compact_response_replaces_transcript_with_readable_summary() -> N
         )
 
 
+def test_local_compact_keeps_recent_user_messages_with_token_budget() -> None:
+    previous_limit = proxy_server.LOCAL_COMPACT_USER_MESSAGE_MAX_TOKENS
+    try:
+        proxy_server.LOCAL_COMPACT_USER_MESSAGE_MAX_TOKENS = 4
+        transcript = [
+            record("user", "older user message that should be dropped"),
+            record("assistant", "assistant output that should be summarized"),
+            record("user", "middle12"),
+            record("user", "latest12"),
+        ]
+
+        compacted = proxy_server.local_compacted_transcript(transcript, REMOTE_SUMMARY_TEXT)
+
+        assert provider_texts(compacted) == [
+            "middle12",
+            "latest12",
+            f"{proxy_server.LOCAL_COMPACT_SUMMARY_PREFIX}\n\n{REMOTE_SUMMARY_TEXT}",
+        ]
+    finally:
+        proxy_server.LOCAL_COMPACT_USER_MESSAGE_MAX_TOKENS = previous_limit
+
+
+def test_local_compact_truncates_oldest_selected_user_message_at_budget() -> None:
+    previous_limit = proxy_server.LOCAL_COMPACT_USER_MESSAGE_MAX_TOKENS
+    try:
+        proxy_server.LOCAL_COMPACT_USER_MESSAGE_MAX_TOKENS = 3
+        transcript = [
+            record("user", "older user message"),
+            record("user", "latest12"),
+        ]
+
+        compacted = proxy_server.local_compacted_transcript(transcript, REMOTE_SUMMARY_TEXT)
+
+        assert provider_texts(compacted)[:2] == ["olde", "latest12"]
+    finally:
+        proxy_server.LOCAL_COMPACT_USER_MESSAGE_MAX_TOKENS = previous_limit
+
+
 def test_context_workbench_compressed_nodes_stay_independent_after_cleaning() -> None:
     transcript = [
         proxy_server.transcript_record(
@@ -2130,6 +2168,8 @@ def main() -> None:
     test_compaction_summary_visible_text_without_encrypted_content()
     test_compaction_visible_text_falls_back_to_encrypted_content()
     test_local_compact_response_replaces_transcript_with_readable_summary()
+    test_local_compact_keeps_recent_user_messages_with_token_budget()
+    test_local_compact_truncates_oldest_selected_user_message_at_budget()
     test_context_workbench_compressed_nodes_stay_independent_after_cleaning()
     test_context_workbench_compress_nodes_replaces_tool_heavy_node()
     test_context_workbench_hides_internal_prefix_nodes_from_editing()
