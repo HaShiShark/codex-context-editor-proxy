@@ -15,6 +15,7 @@ import type {
   ContextRevisionSummary,
   MessageRecord,
   PendingContextRestore,
+  ProxyUsageSummary,
   ReasoningOption,
 } from '../types';
 import {
@@ -40,15 +41,17 @@ interface ContextMapSidebarProps {
   contextRevisionHistory: ContextRevisionSummary[];
   pendingContextRestore: PendingContextRestore | null;
   reasoningOptions: ReasoningOption[];
+  proxyUsageSummary: ProxyUsageSummary | null;
   uiLocale: 'zh-CN' | 'en-US';
   onContextWorkbenchHistoryChange: (sessionId: string, history: ContextWorkbenchHistoryEntry[]) => void;
   onContextWorkbenchConversationChange: (
     sessionId: string,
     conversation: MessageRecord[],
-    options?: { resetProxyOverride?: boolean },
+    options?: { resetProxyOverride?: boolean; skipProxyOverride?: boolean },
   ) => void | Promise<void>;
   onContextRevisionHistoryChange: (sessionId: string, revisions: ContextRevisionSummary[]) => void;
   onPendingContextRestoreChange: (sessionId: string, pendingRestore: PendingContextRestore | null) => void;
+  onProxyUsageSummaryChange: (summary: ProxyUsageSummary | null) => void;
   onEnsureSession: () => Promise<string>;
   onUiLocaleChange?: (locale: 'zh-CN' | 'en-US') => void;
 }
@@ -154,6 +157,22 @@ function areIndexSetsEqual(left: Set<number>, right: Set<number>) {
   return left.size === right.size && [...left].every((index) => right.has(index));
 }
 
+function contextMapContentSignature(messages: MessageRecord[]) {
+  return JSON.stringify(
+    messages.map((message) => ({
+      role: message.role,
+      text: message.text,
+      attachments: message.attachments.map((attachment) => ({
+        name: attachment.name,
+        mime_type: attachment.mime_type,
+      })),
+      blocks: message.blocks,
+      toolEvents: message.toolEvents,
+      providerItems: message.providerItems,
+    })),
+  );
+}
+
 function areNodeLayoutsEqual(left: NodeLayout[], right: NodeLayout[]) {
   return (
     left.length === right.length
@@ -173,9 +192,13 @@ function canExpandMessage(record: MessageRecord, previewText: string, isPreviewT
   void previewText;
   const textValue = record.text || '';
   const trimmedTextValue = textValue.trim();
+  const hasAttachmentsOrTools = Boolean(record.attachments.length || record.toolEvents.length);
+  if (record.role === 'user') {
+    return hasAttachmentsOrTools || /\r?\n/.test(trimmedTextValue) || isPreviewTruncated;
+  }
+
   const hasStructuredContent = Boolean(
-    record.attachments.length
-    || record.toolEvents.length
+    hasAttachmentsOrTools
     || record.blocks.length > 1
     || /\r?\n/.test(trimmedTextValue),
   );
@@ -194,11 +217,13 @@ export default function ContextMapSidebar({
   contextRevisionHistory,
   pendingContextRestore,
   reasoningOptions,
+  proxyUsageSummary,
   uiLocale,
   onContextWorkbenchHistoryChange,
   onContextWorkbenchConversationChange,
   onContextRevisionHistoryChange,
   onPendingContextRestoreChange,
+  onProxyUsageSummaryChange,
   onEnsureSession,
   onUiLocaleChange,
 }: ContextMapSidebarProps) {
@@ -219,6 +244,7 @@ export default function ContextMapSidebar({
     hasMoved: boolean;
   } | null>(null);
   const selectionAutoScrollFrameRef = useRef<number | null>(null);
+  const lastContentSignatureRef = useRef('');
   const [expandedIndexes, setExpandedIndexes] = useState<Set<number>>(new Set());
   const [selectedIndexes, setSelectedIndexes] = useState<Set<number>>(new Set());
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
@@ -227,6 +253,7 @@ export default function ContextMapSidebar({
   const [scrollMetrics, setScrollMetrics] = useState<ScrollMetrics>(DEFAULT_SCROLL_METRICS);
   const [tokenThresholds, setTokenThresholds] = useState<ContextTokenThresholds>(DEFAULT_CONTEXT_TOKEN_THRESHOLDS);
   const showMinimap = stage === 2;
+  const contentSignature = useMemo(() => contextMapContentSignature(messages), [messages]);
   const nodeMeta = useMemo(() => buildContextMapNodeMeta(messages), [messages]);
   const selectableIndexes = useMemo(
     () => new Set(nodeMeta.map((meta, index) => (meta.selectable ? index : -1)).filter((index) => index >= 0)),
@@ -365,6 +392,8 @@ export default function ContextMapSidebar({
     setExpandedIndexes(new Set());
     setSelectedIndexes(new Set());
     setHoveredIndex(null);
+    selectionDragRef.current = null;
+    minimapDragRef.current = null;
     nodeRefs.current = [];
     setNodeLayouts([]);
     setScrollMetrics(DEFAULT_SCROLL_METRICS);
@@ -372,6 +401,26 @@ export default function ContextMapSidebar({
       scrollRef.current.scrollTop = 0;
     }
   }, [sessionId]);
+
+  useEffect(() => {
+    if (!lastContentSignatureRef.current) {
+      lastContentSignatureRef.current = contentSignature;
+      return;
+    }
+
+    if (lastContentSignatureRef.current === contentSignature) {
+      return;
+    }
+
+    lastContentSignatureRef.current = contentSignature;
+    setExpandedIndexes(new Set());
+    setSelectedIndexes(new Set());
+    setHoveredIndex(null);
+    selectionDragRef.current = null;
+    minimapDragRef.current = null;
+    nodeRefs.current = [];
+    setNodeLayouts([]);
+  }, [contentSignature]);
 
   useEffect(() => {
     setExpandedIndexes((previous) => {
@@ -1041,11 +1090,13 @@ export default function ContextMapSidebar({
           revisions={contextRevisionHistory}
           pendingRestore={pendingContextRestore}
           reasoningOptions={reasoningOptions}
+          proxyUsageSummary={proxyUsageSummary}
           uiLocale={uiLocale}
           onHistoryChange={onContextWorkbenchHistoryChange}
           onConversationChange={onContextWorkbenchConversationChange}
           onRevisionHistoryChange={onContextRevisionHistoryChange}
           onPendingRestoreChange={onPendingContextRestoreChange}
+          onProxyUsageSummaryChange={onProxyUsageSummaryChange}
           onEnsureSession={onEnsureSession}
           onTokenThresholdsChange={setTokenThresholds}
           onUiLocaleChange={onUiLocaleChange}

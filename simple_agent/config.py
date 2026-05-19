@@ -36,6 +36,7 @@ CODEX_PROXY_BASE_URL = (
     f"{os.getenv('HASH_CONTEXT_PROXY_PORT', '8787')}/v1"
 )
 DEFAULT_CODEX_PROXY_MODELS: tuple[dict[str, str], ...] = (
+    {"id": "gpt-5.5", "label": "gpt-5.5", "group": "Codex", "provider": "Codex"},
     {"id": "gpt-5.4-mini", "label": "gpt-5.4-mini", "group": "Codex", "provider": "Codex"},
     {"id": "gpt-5.4", "label": "gpt-5.4", "group": "Codex", "provider": "Codex"},
     {"id": "gpt-5.2", "label": "gpt-5.2", "group": "Codex", "provider": "Codex"},
@@ -60,7 +61,7 @@ DEFAULT_RESPONSE_PROVIDERS: tuple[dict[str, object], ...] = (
         "supports_model_fetch": True,
         "supports_responses": True,
         "api_base_url": CODEX_PROXY_BASE_URL,
-        "default_model": "gpt-5.4-mini",
+        "default_model": "gpt-5.5",
         "models": DEFAULT_CODEX_PROXY_MODELS,
     },
     {
@@ -578,7 +579,12 @@ def load_settings() -> Settings:
         or "gpt-5.4-mini"
     )
     default_reasoning_effort = _normalize_reasoning_effort(stored.get("default_reasoning_effort"))
-    context_workbench_model = _clean_string(stored.get("context_workbench_model")) or model
+    context_workbench_model = (
+        _clean_string(stored.get("context_workbench_model"))
+        or _clean_string(os.getenv("HASH_CONTEXT_WORKBENCH_MODEL"))
+        or _clean_string(DEFAULT_CODEX_PROXY_MODELS[0].get("id"))
+        or model
+    )
     context_token_warning_threshold, context_token_critical_threshold = _normalize_context_token_thresholds(
         stored.get("context_token_warning_threshold"),
         stored.get("context_token_critical_threshold"),

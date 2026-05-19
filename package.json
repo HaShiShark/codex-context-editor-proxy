@@ -1,6 +1,6 @@
 {
   "name": "hash-context-codex-lab",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "private": true,
   "description": "Local context proxy and workbench companion for Codex.",
   "author": "",
@@ -28,7 +28,7 @@
     "dev": "vite --config react_app/vite.config.ts",
     "dev:react": "vite --config react_app/vite.config.ts",
     "typecheck": "tsc -p react_app/tsconfig.json --noEmit",
-    "test:compact-proxy": "if exist .venv\\Scripts\\python.exe (.venv\\Scripts\\python.exe scripts/test_compact_proxy.py) else (py -3 scripts/test_compact_proxy.py)",
+    "test:compact-proxy": "node scripts/run-compact-proxy-test.mjs",
     "build": "npm run build:react",
     "build:react": "vite build --config react_app/vite.config.ts",
     "build:python": "node scripts/build-python.mjs",

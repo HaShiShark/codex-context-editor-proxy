@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, screen } = require('electron');
 const { spawn, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const http = require('node:http');
@@ -78,8 +78,12 @@ function showWindow(options = {}) {
   if (mainWindow.isMinimized()) {
     mainWindow.restore();
   }
+
+  ensureWindowOnVisibleDisplay();
   mainWindow.show();
+  mainWindow.moveTop();
   mainWindow.focus();
+  bringWindowToFront();
   const sessionId = typeof options.sessionId === 'string' ? options.sessionId.trim() : '';
   const detail = JSON.stringify({ sessionId });
   const sessionLiteral = JSON.stringify(sessionId);
@@ -97,6 +101,52 @@ function showWindow(options = {}) {
     writeLog(`show refresh dispatch failed: ${error instanceof Error ? error.message : String(error)}`);
   });
   return true;
+}
+
+function ensureWindowOnVisibleDisplay() {
+  if (!mainWindow) {
+    return;
+  }
+
+  const bounds = mainWindow.getBounds();
+  const displays = screen.getAllDisplays();
+  const intersectsDisplay = displays.some((display) => {
+    const area = display.workArea;
+    return (
+      bounds.x < area.x + area.width &&
+      bounds.x + bounds.width > area.x &&
+      bounds.y < area.y + area.height &&
+      bounds.y + bounds.height > area.y
+    );
+  });
+
+  if (intersectsDisplay) {
+    return;
+  }
+
+  const display = screen.getDisplayNearestPoint({ x: 0, y: 0 });
+  const area = display.workArea;
+  const width = Math.min(Math.max(bounds.width, MIN_WINDOW_WIDTH), area.width);
+  const height = Math.min(Math.max(bounds.height, MIN_WINDOW_HEIGHT), area.height);
+  mainWindow.setBounds(
+    {
+      x: Math.round(area.x + (area.width - width) / 2),
+      y: Math.round(area.y + (area.height - height) / 2),
+      width,
+      height,
+    },
+    false,
+  );
+  writeLog('window was off-screen; moved to nearest display');
+}
+
+function bringWindowToFront() {
+  if (!mainWindow) {
+    return;
+  }
+
+  mainWindow.setAlwaysOnTop(true, 'screen-saver');
+  mainWindow.setAlwaysOnTop(false);
 }
 
 function startControlServer() {
@@ -340,6 +390,16 @@ async function startFrontend(root) {
   writeLog('frontend ready');
 }
 
+async function warmContextWorkbenchModels() {
+  try {
+    if (await requestOk(BACKEND_PORT, '/api/context-workbench-settings', PROBE_HOST)) {
+      writeLog('context workbench models refreshed');
+    }
+  } catch (error) {
+    writeLog(`context workbench model refresh skipped: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 function iconPath(root) {
   const iconName = process.platform === 'win32' ? 'hash-icon.ico' : 'hash-icon.png';
   const localIcon = path.join(root, 'electron', 'assets', iconName);
@@ -467,6 +527,7 @@ async function boot() {
   writeLog(`boot root=${root}`);
   await startProxy(root);
   await startBackend(root);
+  await warmContextWorkbenchModels();
   if (USE_VITE_FRONTEND) {
     await startFrontend(root);
   } else {

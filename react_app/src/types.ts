@@ -253,6 +253,26 @@ export interface PendingContextRestore {
   can_undo: boolean;
 }
 
+export interface ProxyUsageBucket {
+  request_count: number;
+  input_tokens: number;
+  cached_input_tokens: number;
+  non_cached_input_tokens: number;
+  output_tokens: number;
+  reasoning_tokens: number;
+  total_tokens: number;
+  known_cost_usd: number;
+  unknown_cost_request_count: number;
+  cache_hit_rate: number;
+  latest_at?: string;
+}
+
+export interface ProxyUsageSummary extends ProxyUsageBucket {
+  session_id: string;
+  by_kind?: Record<string, ProxyUsageBucket>;
+  by_model?: Record<string, ProxyUsageBucket>;
+}
+
 export interface SettingsDraft {
   openai_api_key: string;
   openai_base_url: string;
@@ -444,6 +464,11 @@ export interface StreamToolEvent {
   tool_event: ToolEvent;
 }
 
+export interface ContextChatFinalizingEvent {
+  type: 'finalizing';
+  stage?: 'commit' | string;
+}
+
 export interface StreamDoneEvent extends SidebarPayload {
   type: 'done';
   answer: string;
@@ -485,6 +510,7 @@ export type ContextChatStreamEvent =
   | StreamReasoningStartEvent
   | StreamReasoningDoneEvent
   | StreamToolEvent
+  | ContextChatFinalizingEvent
   | StreamErrorEvent
   | ContextChatStreamDoneEvent;
 

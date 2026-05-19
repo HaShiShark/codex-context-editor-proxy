@@ -153,8 +153,6 @@ const TEXT_TRANSLATIONS: Record<string, string> = {
   '混合': 'Mixed',
   '更新': 'Update',
   '用户': 'User',
-  '查看概览': 'View overview',
-  '查看当前选中节点，或者先基于整份快照做一轮概览判断。': 'Review selected nodes, or inspect the whole snapshot first.',
   '展开节点详情': 'Expand node details',
   '把一个或多个节点展开成完整内容和可编辑条目视图，再决定要不要编辑。': 'Expand nodes into full content and editable items before deciding whether to edit.',
   '删除单个条目': 'Delete one item',

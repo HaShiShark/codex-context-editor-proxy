@@ -126,12 +126,35 @@ function Find-LatestHistorySessionId {
   return ""
 }
 
+function Test-ProxySessionExists {
+  param(
+    [string] $SessionId
+  )
+
+  if (-not $SessionId) {
+    return $false
+  }
+
+  try {
+    $encodedSessionId = [uri]::EscapeDataString($SessionId)
+    Invoke-WebRequest -Uri "http://${serviceProbeHost}:8765/api/proxy/sessions/$encodedSessionId" -Method Get -UseBasicParsing -TimeoutSec 2 | Out-Null
+    return $true
+  } catch {
+    return $false
+  }
+}
+
 function Sync-LocalCodexSession {
   param(
     [string] $SessionId
   )
 
   if (-not $SessionId) {
+    return
+  }
+
+  if (Test-ProxySessionExists -SessionId $SessionId) {
+    Write-HookLog "local-session-sync skipped proxy-session-exists session_id=$SessionId"
     return
   }
 
@@ -150,6 +173,11 @@ function Start-LocalCodexSessionSync {
   )
 
   if (-not $SessionId) {
+    return
+  }
+
+  if (Test-ProxySessionExists -SessionId $SessionId) {
+    Write-HookLog "local-session-sync skipped proxy-session-exists session_id=$SessionId"
     return
   }
 

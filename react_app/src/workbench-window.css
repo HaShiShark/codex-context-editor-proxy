@@ -272,15 +272,20 @@ html[data-workbench-window-resizing] * {
   -webkit-app-region: no-drag;
 }
 
-.workbench-window-state {
-  position: relative;
+.workbench-window-shell.loading {
   display: grid;
-  min-height: 100vh;
-  place-content: center;
-  gap: 12px;
-  padding: 28px;
+  place-items: center;
   color: var(--an-text, #f4f4f5);
   background: var(--an-bg, #09090b);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 22px 70px rgba(0, 0, 0, 0.5);
+}
+
+.workbench-window-state-panel {
+  display: grid;
+  max-width: 560px;
+  gap: 12px;
+  padding: 28px;
   text-align: center;
 }
 

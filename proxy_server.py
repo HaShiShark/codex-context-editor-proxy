@@ -802,6 +802,73 @@ def session_id_for_request(body: dict[str, Any], headers: dict[str, str]) -> str
     return f"session-{digest[:16]}"
 
 
+CODEX_SESSION_HEADER_NAMES = {
+    "session-id",
+    "session_id",
+    "thread-id",
+    "thread_id",
+    "x-client-request-id",
+    "x-codex-beta-features",
+    "x-codex-installation-id",
+    "x-codex-parent-thread-id",
+    "x-codex-turn-metadata",
+    "x-codex-turn-state",
+    "x-codex-window-id",
+    "x-openai-subagent",
+}
+
+
+def codex_session_headers_from_request(headers: dict[str, str]) -> dict[str, str]:
+    return {
+        key.lower(): str(value)
+        for key, value in headers.items()
+        if key.lower() in CODEX_SESSION_HEADER_NAMES and str(value).strip()
+    }
+
+
+def fallback_codex_session_headers(session_id: str) -> dict[str, str]:
+    safe_session_id = sanitize_id(session_id)
+    if not safe_session_id:
+        return {}
+    return {
+        "session-id": safe_session_id,
+        "session_id": safe_session_id,
+        "thread-id": safe_session_id,
+        "thread_id": safe_session_id,
+        "x-client-request-id": safe_session_id,
+        "x-codex-window-id": f"{safe_session_id}:0",
+        "x-codex-turn-metadata": json.dumps(
+            {
+                "session_id": safe_session_id,
+                "thread_id": safe_session_id,
+                "thread_source": "hash_context_workbench",
+                "turn_id": f"hash-context-{safe_session_id}",
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    }
+
+
+def merge_codex_session_headers(
+    headers: dict[str, str],
+    session_headers: dict[str, str],
+    *,
+    session_id: str = "",
+) -> dict[str, str]:
+    merged = dict(headers)
+    effective_session_headers = dict(session_headers)
+    for key, value in fallback_codex_session_headers(session_id).items():
+        effective_session_headers.setdefault(key, value)
+    lowered_existing = {key.lower() for key in merged}
+    for key, value in effective_session_headers.items():
+        lower_key = key.lower()
+        if lower_key in lowered_existing or not str(value).strip():
+            continue
+        merged[lower_key] = str(value)
+    return merged
+
+
 def session_id_for_compact_request(body: dict[str, Any], headers: dict[str, str], active_session_id: str) -> str:
     for key in ("x-hash-context-session-id", "x-codex-conversation-id", "x-codex-session-id"):
         value = headers.get(key)
@@ -868,6 +935,7 @@ def response_headers_for_upstream(headers: dict[str, str]) -> dict[str, str]:
         "accept-encoding",
         "transfer-encoding",
         INTERNAL_CONTEXT_HEADER,
+        "x-hash-context-session-id",
     }
     canonical_names = {
         "accept": "Accept",
@@ -1479,6 +1547,196 @@ def local_compacted_transcript(source_transcript: list[dict[str, Any]], assistan
     return clean_transcript(retained)
 
 
+USAGE_EVENT_LIMIT = 500
+
+
+def usage_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    if isinstance(value, str):
+        try:
+            return max(0, int(float(value.strip())))
+        except ValueError:
+            return 0
+    return 0
+
+
+def usage_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return max(0.0, float(value))
+    if isinstance(value, str):
+        try:
+            return max(0.0, float(value.strip()))
+        except ValueError:
+            return None
+    return None
+
+
+def first_usage_int(record: dict[str, Any], *keys: str) -> int:
+    for key in keys:
+        if key in record:
+            value = usage_int(record.get(key))
+            if value:
+                return value
+    return 0
+
+
+GPT55_INPUT_USD_PER_MILLION = 1.25
+GPT55_CACHED_INPUT_USD_PER_MILLION = 0.125
+GPT55_OUTPUT_USD_PER_MILLION = 10.0
+
+
+def estimate_gpt55_cost_usd(input_tokens: int, cached_input_tokens: int, output_tokens: int) -> float:
+    cached_tokens = min(max(0, cached_input_tokens), max(0, input_tokens))
+    non_cached_tokens = max(0, input_tokens - cached_tokens)
+    return (
+        (non_cached_tokens * GPT55_INPUT_USD_PER_MILLION)
+        + (cached_tokens * GPT55_CACHED_INPUT_USD_PER_MILLION)
+        + (max(0, output_tokens) * GPT55_OUTPUT_USD_PER_MILLION)
+    ) / 1_000_000
+
+
+def empty_usage_bucket() -> dict[str, Any]:
+    return {
+        "request_count": 0,
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "non_cached_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+        "total_tokens": 0,
+        "known_cost_usd": 0,
+        "unknown_cost_request_count": 0,
+        "cache_hit_rate": 0,
+    }
+
+
+def normalize_usage_payload(raw_usage: Any) -> dict[str, Any] | None:
+    if not isinstance(raw_usage, dict):
+        return None
+
+    input_details = raw_usage.get("input_tokens_details") or raw_usage.get("prompt_tokens_details")
+    if not isinstance(input_details, dict):
+        input_details = {}
+    output_details = raw_usage.get("output_tokens_details") or raw_usage.get("completion_tokens_details")
+    if not isinstance(output_details, dict):
+        output_details = {}
+
+    input_tokens = first_usage_int(raw_usage, "input_tokens", "prompt_tokens")
+    output_tokens = first_usage_int(raw_usage, "output_tokens", "completion_tokens")
+    cached_input_tokens = first_usage_int(
+        raw_usage,
+        "cached_input_tokens",
+        "cache_read_input_tokens",
+        "cached_tokens",
+    ) or first_usage_int(
+        input_details,
+        "cached_tokens",
+        "cached_input_tokens",
+        "cache_read_input_tokens",
+    )
+    reasoning_tokens = first_usage_int(
+        raw_usage,
+        "reasoning_tokens",
+        "reasoning_output_tokens",
+    ) or first_usage_int(
+        output_details,
+        "reasoning_tokens",
+        "reasoning_output_tokens",
+    )
+    total_tokens = first_usage_int(raw_usage, "total_tokens") or input_tokens + output_tokens
+    if not any((input_tokens, output_tokens, cached_input_tokens, reasoning_tokens, total_tokens)):
+        return None
+
+    bucket = empty_usage_bucket()
+    bucket.update(
+        {
+            "input_tokens": input_tokens,
+            "cached_input_tokens": min(cached_input_tokens, input_tokens) if input_tokens else cached_input_tokens,
+            "output_tokens": output_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "total_tokens": total_tokens,
+            "unknown_cost_request_count": 0,
+        }
+    )
+    bucket["non_cached_input_tokens"] = max(0, bucket["input_tokens"] - bucket["cached_input_tokens"])
+    bucket["known_cost_usd"] = estimate_gpt55_cost_usd(
+        bucket["input_tokens"],
+        bucket["cached_input_tokens"],
+        bucket["output_tokens"],
+    )
+    bucket["cache_hit_rate"] = (
+        bucket["cached_input_tokens"] / bucket["input_tokens"] if bucket["input_tokens"] else 0
+    )
+    return bucket
+
+
+def usage_event(kind: str, model: str, raw_usage: Any) -> dict[str, Any] | None:
+    usage = normalize_usage_payload(raw_usage)
+    if usage is None:
+        return None
+    return {
+        "created_at": utc_timestamp(),
+        "kind": kind,
+        "model": model.strip() or "unknown",
+        "usage": usage,
+    }
+
+
+def add_usage_to_bucket(bucket: dict[str, Any], usage: dict[str, Any], created_at: str) -> None:
+    bucket["request_count"] += 1
+    for key in (
+        "input_tokens",
+        "cached_input_tokens",
+        "non_cached_input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "total_tokens",
+    ):
+        bucket[key] += usage_int(usage.get(key))
+    bucket["known_cost_usd"] += estimate_gpt55_cost_usd(
+        usage_int(usage.get("input_tokens")),
+        usage_int(usage.get("cached_input_tokens")),
+        usage_int(usage.get("output_tokens")),
+    )
+    bucket["unknown_cost_request_count"] = 0
+    bucket["cache_hit_rate"] = (
+        bucket["cached_input_tokens"] / bucket["input_tokens"] if bucket["input_tokens"] else 0
+    )
+    if created_at and (not bucket.get("latest_at") or created_at > str(bucket.get("latest_at") or "")):
+        bucket["latest_at"] = created_at
+
+
+def usage_summary_from_events(session_id: str, events: list[dict[str, Any]]) -> dict[str, Any]:
+    summary = empty_usage_bucket()
+    summary["session_id"] = session_id
+    by_kind: dict[str, dict[str, Any]] = {}
+    by_model: dict[str, dict[str, Any]] = {}
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        usage = event.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        created_at = str(event.get("created_at") or "")
+        kind = str(event.get("kind") or "unknown").strip() or "unknown"
+        model = str(event.get("model") or "unknown").strip() or "unknown"
+        add_usage_to_bucket(summary, usage, created_at)
+        kind_bucket = by_kind.setdefault(kind, empty_usage_bucket())
+        add_usage_to_bucket(kind_bucket, usage, created_at)
+        model_bucket = by_model.setdefault(model, empty_usage_bucket())
+        add_usage_to_bucket(model_bucket, usage, created_at)
+
+    summary["by_kind"] = by_kind
+    summary["by_model"] = by_model
+    return summary
+
+
 @dataclass
 class ProxySession:
     id: str
@@ -1490,6 +1748,8 @@ class ProxySession:
     local_compact_source_transcript: list[dict[str, Any]] | None = None
     request_log: list[dict[str, Any]] = field(default_factory=list)
     response_items: list[dict[str, Any]] = field(default_factory=list)
+    usage_events: list[dict[str, Any]] = field(default_factory=list)
+    last_codex_session_headers: dict[str, str] = field(default_factory=dict)
     last_turn_metadata_header: str = ""
     last_error: str = ""
     created_at: str = field(default_factory=utc_timestamp)
@@ -1502,20 +1762,32 @@ class ProxySession:
             return self.edited_transcript
         return self.transcript
 
-    def to_payload(self) -> dict[str, Any]:
+    def usage_summary(self) -> dict[str, Any]:
+        return usage_summary_from_events(self.id, self.usage_events)
+
+    def metadata_payload(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "title": self.title,
             "status": self.status,
-            "transcript": self.visible_transcript(),
-            "raw_transcript": self.transcript,
-            "edited_transcript": self.edited_transcript,
-            "pending_transcript": self.pending_transcript,
+            "active_context_source": "pending" if self.pending_transcript is not None else "committed" if self.edited_transcript is not None else "raw",
             "has_override": self.edited_transcript is not None,
             "is_running": self.status in {"running", "compacting"},
             "last_error": self.last_error,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "usage_summary": self.usage_summary(),
+        }
+
+    def to_payload(self) -> dict[str, Any]:
+        visible_transcript = self.visible_transcript()
+        return {
+            **self.metadata_payload(),
+            "transcript": visible_transcript,
+            "active_transcript": visible_transcript,
+            "raw_transcript": self.transcript,
+            "edited_transcript": self.edited_transcript,
+            "pending_transcript": self.pending_transcript,
         }
 
     def should_expose(self) -> bool:
@@ -1554,6 +1826,12 @@ class ProxyStore:
                 else None,
                 request_log=raw.get("request_log") if isinstance(raw.get("request_log"), list) else [],
                 response_items=raw.get("response_items") if isinstance(raw.get("response_items"), list) else [],
+                usage_events=raw.get("usage_events") if isinstance(raw.get("usage_events"), list) else [],
+                last_codex_session_headers=(
+                    raw.get("last_codex_session_headers")
+                    if isinstance(raw.get("last_codex_session_headers"), dict)
+                    else {}
+                ),
                 last_turn_metadata_header=str(raw.get("last_turn_metadata_header") or ""),
                 last_error=str(raw.get("last_error") or ""),
                 created_at=str(raw.get("created_at") or utc_timestamp()),
@@ -1573,12 +1851,14 @@ class ProxyStore:
                     "transcript": session.transcript,
                     "edited_transcript": session.edited_transcript,
                     "pending_transcript": session.pending_transcript,
+                    "last_codex_session_headers": session.last_codex_session_headers,
                     "last_turn_metadata_header": session.last_turn_metadata_header,
                     "last_error": session.last_error,
                     "created_at": session.created_at,
                     "updated_at": session.updated_at,
                     "request_log": session.request_log[-20:],
                     "response_items": session.response_items[-100:],
+                    "usage_events": session.usage_events[-USAGE_EVENT_LIMIT:],
                 }
                 for session in self.sessions.values()
             ],
@@ -1597,6 +1877,9 @@ class ProxyStore:
                 input_items_to_transcript(body.get("input"))
             )
             current_turn_metadata = request_turn_metadata(headers)
+            current_codex_session_headers = codex_session_headers_from_request(headers)
+            if current_codex_session_headers:
+                session.last_codex_session_headers = current_codex_session_headers
             previous_turn_metadata = session.last_turn_metadata_header
             if session.edited_transcript is not None:
                 merged_body_transcript = merge_override_transcript(
@@ -1720,6 +2003,26 @@ class ProxyStore:
             self.save()
             return session, request_body
 
+    def codex_session_headers(self, session_id: str) -> dict[str, str]:
+        with self.lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                return {}
+            if session.last_codex_session_headers:
+                return dict(session.last_codex_session_headers)
+            for entry in reversed(session.request_log):
+                if not isinstance(entry, dict):
+                    continue
+                entry_headers = entry.get("headers")
+                if not isinstance(entry_headers, dict):
+                    continue
+                session_headers = codex_session_headers_from_request(
+                    {str(key).lower(): str(value) for key, value in entry_headers.items()}
+                )
+                if session_headers:
+                    return session_headers
+            return {}
+
     def record_control_intercept(self, session_id: str, body: dict[str, Any], headers: dict[str, str], command: str) -> ProxySession:
         with self.lock:
             session = self.sessions.get(session_id)
@@ -1735,6 +2038,12 @@ class ProxyStore:
             session.pending_transcript = None
             session.local_compact_source_transcript = None
             session.status = "override" if session.edited_transcript is not None else "mirror"
+            current_codex_session_headers = codex_session_headers_from_request(headers)
+            if current_codex_session_headers:
+                session.last_codex_session_headers = current_codex_session_headers
+            current_turn_metadata = request_turn_metadata(headers)
+            if current_turn_metadata:
+                session.last_turn_metadata_header = current_turn_metadata
             session.last_error = ""
             session.updated_at = utc_timestamp()
             self.active_session_id = session_id
@@ -1869,6 +2178,52 @@ class ProxyStore:
             session.updated_at = utc_timestamp()
             self.save()
 
+    def record_usage(self, session_id: str, kind: str, model: str, raw_usage: Any) -> None:
+        event = usage_event(kind, model, raw_usage)
+        if event is None:
+            return
+        with self.lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                session = ProxySession(id=session_id, title=f"Codex {session_id[:8]}")
+                self.sessions[session_id] = session
+            session.usage_events.append(event)
+            session.usage_events = session.usage_events[-USAGE_EVENT_LIMIT:]
+            session.updated_at = utc_timestamp()
+            self.save()
+
+    def all_usage(self) -> dict[str, Any]:
+        with self.lock:
+            exposed_sessions = [session for session in self.sessions.values() if session.should_expose()]
+            all_events: list[dict[str, Any]] = []
+            sessions: dict[str, dict[str, Any]] = {}
+            for session in exposed_sessions:
+                events = [event for event in session.usage_events if isinstance(event, dict)]
+                all_events.extend(events)
+                sessions[session.id] = usage_summary_from_events(session.id, events)
+            return {
+                "overall": usage_summary_from_events("overall", all_events),
+                "sessions": sessions,
+            }
+
+    def session_usage(self, session_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                return None
+            return {"summary": session.usage_summary()}
+
+    def reset_usage(self, session_id: str) -> dict[str, Any]:
+        with self.lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                raise KeyError(session_id)
+            cleared_count = len(session.usage_events)
+            session.usage_events = []
+            session.updated_at = utc_timestamp()
+            self.save()
+            return {"cleared_count": cleared_count, "summary": session.usage_summary()}
+
     def list_sessions(self) -> dict[str, Any]:
         with self.lock:
             sessions = [
@@ -1881,7 +2236,7 @@ class ProxyStore:
                 active_session_id = sessions[0].id if sessions else ""
             return {
                 "active_session_id": active_session_id,
-                "sessions": [session.to_payload() for session in sessions],
+                "sessions": [session.metadata_payload() for session in sessions],
             }
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
@@ -2179,6 +2534,17 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/proxy/sessions":
             self._send_json(STORE.list_sessions())
             return
+        if parsed.path == "/api/proxy/usage":
+            self._send_json(STORE.all_usage())
+            return
+        if parsed.path.startswith("/api/proxy/sessions/") and parsed.path.endswith("/usage"):
+            session_id = urllib.parse.unquote(parsed.path.split("/api/proxy/sessions/", 1)[1].rsplit("/", 1)[0])
+            usage = STORE.session_usage(session_id)
+            if usage is None:
+                self._send_json({"error": "session not found"}, HTTPStatus.NOT_FOUND)
+                return
+            self._send_json(usage)
+            return
         if parsed.path.startswith("/api/proxy/sessions/"):
             session_id = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1])
             session = STORE.get_session(session_id)
@@ -2265,6 +2631,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send_json(STORE.override(session_id, transcript))
             return
+        if parsed.path.endswith("/usage/reset") and parsed.path.startswith("/api/proxy/sessions/"):
+            session_id = urllib.parse.unquote(parsed.path.split("/api/proxy/sessions/", 1)[1].rsplit("/usage/", 1)[0])
+            try:
+                self._send_json(STORE.reset_usage(session_id))
+            except KeyError:
+                self._send_json({"error": "session not found"}, HTTPStatus.NOT_FOUND)
+            return
         if parsed.path.endswith("/reset") and parsed.path.startswith("/api/proxy/sessions/"):
             session_id = urllib.parse.unquote(parsed.path.split("/api/proxy/sessions/", 1)[1].rsplit("/", 1)[0])
             try:
@@ -2350,14 +2723,20 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         if is_internal_context:
-            session_id = INTERNAL_CONTEXT_VALUE
+            session_id = session_id_for_request(body, headers)
+            headers_for_upstream = merge_codex_session_headers(
+                headers,
+                STORE.codex_session_headers(session_id),
+                session_id=session_id,
+            )
             forwarded_body = copy.deepcopy(body)
         else:
             session_id = session_id_for_request(body, headers)
+            headers_for_upstream = headers
             _session, forwarded_body = STORE.begin_request(session_id, body, headers)
-        upstream_base_url = upstream_base_url_for_request(headers)
+        upstream_base_url = upstream_base_url_for_request(headers_for_upstream)
         upstream = urllib.parse.urlparse(upstream_base_url.rstrip("/") + "/responses")
-        effective_headers = apply_cached_upstream_auth(headers)
+        effective_headers = apply_cached_upstream_auth(headers_for_upstream)
         effective_lowered = {key.lower(): value for key, value in effective_headers.items()}
         auth_kind = "chatgpt" if effective_lowered.get("chatgpt-account-id") else "api-key-or-bearer"
         proxy_log(
@@ -2372,7 +2751,7 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             payload = json.dumps(forwarded_body, ensure_ascii=False).encode("utf-8")
-            upstream_headers = upstream_headers_for_request(headers, accept="text/event-stream")
+            upstream_headers = upstream_headers_for_request(headers_for_upstream, accept="text/event-stream")
             proxy_log(
                 f"upstream headers session={session_id} "
                 f"{json.dumps(safe_headers_for_log(upstream_headers), ensure_ascii=False, sort_keys=True)}"
@@ -2390,6 +2769,7 @@ class Handler(BaseHTTPRequestHandler):
 
             response_items: list[dict[str, Any]] = []
             text_parts: list[str] = []
+            completed_responses: list[dict[str, Any]] = []
             buffer = ""
             error_preview = bytearray()
             while True:
@@ -2401,7 +2781,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 self.wfile.flush()
                 buffer += chunk.decode("utf-8", errors="ignore")
-                buffer = parse_sse_buffer(buffer, response_items, text_parts)
+                buffer = parse_sse_buffer(buffer, response_items, text_parts, completed_responses)
 
             if upstream_response.status >= 400:
                 preview = error_preview.decode("utf-8", errors="replace")
@@ -2409,6 +2789,15 @@ class Handler(BaseHTTPRequestHandler):
                 if not is_internal_context:
                     STORE.fail_response(session_id, preview[:1000] or upstream_response.reason)
             else:
+                usage_kind = "context_workbench" if is_internal_context else "main"
+                fallback_model = str(forwarded_body.get("model") or body.get("model") or "")
+                for completed_response in completed_responses:
+                    STORE.record_usage(
+                        session_id,
+                        usage_kind,
+                        str(completed_response.get("model") or fallback_model),
+                        completed_response.get("usage"),
+                    )
                 if not is_internal_context:
                     STORE.complete_response(session_id, response_items, "".join(text_parts))
         except Exception as exc:
@@ -2491,6 +2880,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
             output_items = [copy.deepcopy(item) for item in output if isinstance(item, dict)]
             STORE.complete_compact(session_id, output_items)
+            raw_usage = parsed_body.get("usage") if isinstance(parsed_body, dict) else None
+            if raw_usage is None and isinstance(parsed_body.get("response"), dict):
+                raw_usage = parsed_body["response"].get("usage")
+            STORE.record_usage(
+                session_id,
+                "compact",
+                str(parsed_body.get("model") or body.get("model") or ""),
+                raw_usage,
+            )
         except Exception as exc:
             proxy_log(f"compact error session={session_id} error={type(exc).__name__}: {exc}")
             STORE.fail_response(session_id, str(exc))
@@ -2512,7 +2910,7 @@ class Handler(BaseHTTPRequestHandler):
     def _send_cors_headers(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "authorization, content-type, x-hash-context-session-id")
+        self.send_header("Access-Control-Allow-Headers", "authorization, content-type, x-hash-context-internal, x-hash-context-session-id")
 
     def _send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -2524,7 +2922,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
-def parse_sse_buffer(buffer: str, response_items: list[dict[str, Any]], text_parts: list[str]) -> str:
+def parse_sse_buffer(
+    buffer: str,
+    response_items: list[dict[str, Any]],
+    text_parts: list[str],
+    completed_responses: list[dict[str, Any]] | None = None,
+) -> str:
     def replace_or_append_item(next_item: dict[str, Any]) -> None:
         item_id = str(next_item.get("id") or "").strip()
         call_id = str(next_item.get("call_id") or "").strip()
@@ -2582,6 +2985,8 @@ def parse_sse_buffer(buffer: str, response_items: list[dict[str, Any]], text_par
                     target_item["arguments"] = f"{target_item.get('arguments') or ''}{delta}"
         response = event.get("response")
         if event_type == "response.completed" and isinstance(response, dict):
+            if completed_responses is not None:
+                completed_responses.append(response)
             output = response.get("output")
             if isinstance(output, list):
                 completed_items: list[dict[str, Any]] = []

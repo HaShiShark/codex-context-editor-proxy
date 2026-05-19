@@ -322,13 +322,63 @@ function Stop-ProjectServicePorts {
   $owners = Get-ProjectPortOwners -Ports $ports | Sort-Object Pid -Unique
   foreach ($owner in $owners) {
     try {
-      Stop-Process -Id ([int] $owner.Pid) -Force -ErrorAction Stop
+      & taskkill /pid $([int] $owner.Pid) /t /f | Out-Null
       Write-Host "[hash-context] stopped service pid=$($owner.Pid) port=$($owner.Port) reason=$Reason"
     } catch {
       Write-Host "[hash-context] could not stop service pid=$($owner.Pid): $($_.Exception.Message)" -ForegroundColor DarkYellow
     }
   }
   if ($owners.Count -gt 0) {
+    Start-Sleep -Milliseconds 800
+  }
+}
+
+function Get-ProjectServiceProcesses {
+  $projectPath = [string] $projectRoot.Path
+  return @(
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+      Where-Object {
+        $_.ProcessId -ne $PID -and $_.CommandLine
+      } |
+      Where-Object {
+        $commandLine = [string] $_.CommandLine
+        $inProject = $commandLine.Contains($projectPath)
+        (
+          $commandLine -like "*proxy_server.py*" -or
+          $commandLine -like "*web_server.py*" -or
+          $commandLine -like "*hash-proxy-server*" -or
+          $commandLine -like "*hash-web-server*" -or
+          $commandLine -like "*electron/context-window.cjs*" -or
+          $commandLine -like "*electron\context-window.cjs*" -or
+          $commandLine -like "*Codex Context Proxy.exe*" -or
+          $commandLine -like "*hashcode.exe*" -or
+          ($inProject -and (
+              $commandLine -like "*react_app\vite.config.ts*" -or
+              $commandLine -like "*react_app/vite.config.ts*" -or
+              $commandLine -like "*node_modules*electron*" -or
+              $commandLine -like "*node_modules*vite*" -or
+              $commandLine -like "*--app-path*$projectPath*electron*" -or
+              $commandLine -like "*--user-data-dir*hash-context-codex-lab*"
+            ))
+        )
+      } |
+      Sort-Object ProcessId -Descending
+  )
+}
+
+function Stop-ProjectServiceProcesses {
+  param([string] $Reason)
+
+  $targets = Get-ProjectServiceProcesses | Sort-Object ProcessId -Unique
+  foreach ($target in $targets) {
+    try {
+      & taskkill /pid $([int] $target.ProcessId) /t /f | Out-Null
+      Write-Host "[hash-context] stopped project service pid=$($target.ProcessId) name=$($target.Name) reason=$Reason"
+    } catch {
+      Write-Host "[hash-context] could not stop project service pid=$($target.ProcessId): $($_.Exception.Message)" -ForegroundColor DarkYellow
+    }
+  }
+  if ($targets.Count -gt 0) {
     Start-Sleep -Milliseconds 800
   }
 }
@@ -544,6 +594,8 @@ function Stop-DesktopServices {
       Write-Host "[hash-context] stopped desktop services pid=$pidToStop"
     }
   }
+  Stop-ProjectServicePorts -Reason "desktop services stop"
+  Stop-ProjectServiceProcesses -Reason "desktop services stop"
 }
 
 function Show-DesktopStatus {

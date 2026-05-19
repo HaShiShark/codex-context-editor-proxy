@@ -1288,6 +1288,79 @@ textarea {
   line-height: 1.55;
 }
 
+.usage-summary-card {
+  margin-top: 16px;
+  padding: 16px;
+}
+
+.usage-page-stack {
+  display: grid;
+  gap: 14px;
+  margin-top: 18px;
+}
+
+.usage-actions-row {
+  margin-top: 14px;
+}
+
+.usage-page-stack .usage-summary-card {
+  margin-top: 0;
+}
+
+.usage-summary-card.compact .usage-summary-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.usage-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.usage-summary-item {
+  min-width: 0;
+  padding: 12px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.usage-summary-item span,
+.usage-cost-row span {
+  display: block;
+  color: rgba(255, 255, 255, 0.48);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.usage-summary-item strong {
+  display: block;
+  margin-top: 8px;
+  color: rgba(255, 255, 255, 0.95);
+  font-size: 16px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.usage-cost-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: rgba(123, 211, 137, 0.08);
+  border: 1px solid rgba(123, 211, 137, 0.16);
+}
+
+.usage-cost-row strong {
+  color: rgba(226, 255, 230, 0.98);
+  font-size: 18px;
+  font-weight: 650;
+}
+
 .suggestion-stack {
   display: grid;
   gap: 12px;
@@ -1510,6 +1583,45 @@ textarea {
   min-height: 32px;
   padding: 0 11px;
   font-size: 12px;
+}
+
+.workbench-model-picker-trigger {
+  width: min(100%, 320px);
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.workbench-model-picker-trigger span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workbench-model-picker-trigger + .dropdown-menu {
+  width: min(320px, calc(100vw - 56px));
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+.workbench-model-picker-trigger + .dropdown-menu .dropdown-item-left {
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+.workbench-model-picker-trigger + .dropdown-menu .dropdown-item-left span {
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workbench-model-picker-trigger + .dropdown-menu .dropdown-item-left small {
+  color: rgba(255, 255, 255, 0.42);
+  font-size: 10px;
+  font-weight: 500;
 }
 
 .manual-workbench-input-row {
